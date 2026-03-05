@@ -1,0 +1,41 @@
+{
+  "socks": {
+    "listen": "0.0.0.0:1080",
+    "buffer_size": 65536,
+    "max_connections": 10000
+  },
+  "slipstream_binary": "./orgslipstream/slipstream-rust/target/release/slipstream-client",
+  "strategy": "round_robin",
+  "health_check": {
+    "interval": "10s",
+    "target": "google.com",
+    "timeout": "10s"
+  },
+  "gui": {
+    "enabled": true,
+    "listen": "127.0.0.1:8384"
+  },
+  "instances": [
+    {
+      "domain": "t1.example.com",
+      "resolver": "8.8.8.8:53",
+      "port": 17001,
+      "replicas": 1,
+      "authoritative": false
+    },
+    {
+      "domain": "t2.example.com",
+      "resolver": "1.1.1.1:53",
+      "port": "17002-17005",
+      "replicas": 4,
+      "authoritative": false
+    },
+    {
+      "domain": "t3.example.com",
+      "resolver": "9.9.9.9:53",
+      "port": 17006,
+      "replicas": 1,
+      "authoritative": false
+    }
+  ]
+}

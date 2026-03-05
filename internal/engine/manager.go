@@ -1,0 +1,189 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/slipstreamplus/slipstreamplus/internal/config"
+)
+
+type Manager struct {
+	instances []*Instance
+	binary    string
+	mu        sync.RWMutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+}
+
+func NewManager(cfg *config.Config) (*Manager, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	binary := cfg.SlipstreamBinary
+
+	expanded, err := cfg.ExpandInstances()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("expand instances: %w", err)
+	}
+
+	m := &Manager{
+		binary: binary,
+		ctx:    ctx,
+		cancel: cancel,
+	}
+
+	for i, ei := range expanded {
+		inst := NewInstance(i, ei, binary)
+		m.instances = append(m.instances, inst)
+	}
+
+	log.Printf("[manager] expanded %d config entries into %d instances",
+		len(cfg.Instances), len(m.instances))
+
+	return m, nil
+}
+
+func (m *Manager) SetBinary(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.binary = path
+	for _, inst := range m.instances {
+		inst.Binary = path
+	}
+}
+
+func (m *Manager) StartAll() error {
+	for _, inst := range m.instances {
+		if err := inst.Start(); err != nil {
+			return fmt.Errorf("start instance %d: %w", inst.ID(), err)
+		}
+
+		m.wg.Add(1)
+		go m.supervise(inst)
+	}
+
+	log.Printf("[manager] started %d instances", len(m.instances))
+	return nil
+}
+
+func (m *Manager) supervise(inst *Instance) {
+	defer m.wg.Done()
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		default:
+		}
+
+		err := inst.WaitForExit()
+
+		select {
+		case <-m.ctx.Done():
+			return
+		default:
+		}
+
+		if err != nil {
+			log.Printf("[manager] instance %d (%s:%d) exited: %v",
+				inst.ID(), inst.Config.Domain, inst.Config.Port, err)
+		} else {
+			log.Printf("[manager] instance %d (%s:%d) exited cleanly",
+				inst.ID(), inst.Config.Domain, inst.Config.Port)
+		}
+
+		inst.SetState(StateDead)
+
+		backoff := 1 * time.Second
+		maxBackoff := 30 * time.Second
+		for attempt := 1; ; attempt++ {
+			select {
+			case <-m.ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+
+			log.Printf("[manager] restarting instance %d (%s:%d), attempt %d",
+				inst.ID(), inst.Config.Domain, inst.Config.Port, attempt)
+
+			if err := inst.Start(); err != nil {
+				log.Printf("[manager] restart failed for instance %d: %v", inst.ID(), err)
+				backoff = backoff * 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
+			}
+
+			log.Printf("[manager] instance %d restarted successfully", inst.ID())
+			break
+		}
+	}
+}
+
+func (m *Manager) HealthyInstances() []*Instance {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var healthy []*Instance
+	for _, inst := range m.instances {
+		if inst.IsHealthy() {
+			healthy = append(healthy, inst)
+		}
+	}
+	return healthy
+}
+
+func (m *Manager) AllInstances() []*Instance {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	result := make([]*Instance, len(m.instances))
+	copy(result, m.instances)
+	return result
+}
+
+func (m *Manager) RestartInstance(id int) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, inst := range m.instances {
+		if inst.ID() == id {
+			log.Printf("[manager] manual restart of instance %d", id)
+			if err := inst.Stop(); err != nil {
+				return err
+			}
+			// Supervisor goroutine will detect exit and restart
+			return nil
+		}
+	}
+	return fmt.Errorf("instance %d not found", id)
+}
+
+func (m *Manager) StatusAll() []StatusInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make([]StatusInfo, len(m.instances))
+	for i, inst := range m.instances {
+		result[i] = inst.StatusInfo()
+	}
+	return result
+}
+
+func (m *Manager) Shutdown() {
+	log.Printf("[manager] shutting down...")
+	m.cancel()
+
+	for _, inst := range m.instances {
+		if err := inst.Stop(); err != nil {
+			log.Printf("[manager] error stopping instance %d: %v", inst.ID(), err)
+		}
+	}
+
+	m.wg.Wait()
+	log.Printf("[manager] all instances stopped")
+}
