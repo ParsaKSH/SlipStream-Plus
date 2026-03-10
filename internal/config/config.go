@@ -62,8 +62,10 @@ func (u *UserConfig) DataLimitBytes() int64 {
 }
 
 type GUIConfig struct {
-	Enabled bool   `json:"enabled"`
-	Listen  string `json:"listen"`
+	Enabled  bool   `json:"enabled"`
+	Listen   string `json:"listen"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 type HealthCheckConfig struct {

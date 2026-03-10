@@ -94,7 +94,7 @@ func main() {
 		if *guiPort != "" {
 			cfg.GUI.Listen = *guiPort
 		}
-		apiServer := gui.NewAPIServer(mgr, cfg, *configPath, userMgr)
+		apiServer := gui.NewAPIServer(mgr, cfg, *configPath, userMgr, checker)
 		if err := apiServer.Start(); err != nil {
 			log.Fatalf("Failed to start GUI: %v", err)
 		}
