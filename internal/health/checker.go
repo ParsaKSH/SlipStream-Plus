@@ -13,6 +13,12 @@ import (
 	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 )
 
+// An instance is HEALTHY only after a successful tunnel probe (SOCKS5/SSH).
+// An instance is UNHEALTHY if:
+//   - TCP connect to local port fails (process dead)
+//   - Tunnel probe fails 3 consecutive times (tunnel broken)
+//
+// Latency is only set from successful tunnel probes (real RTT).
 const maxConsecutiveFailures = 3
 
 type Checker struct {
@@ -46,7 +52,7 @@ func NewChecker(mgr *engine.Manager, cfg *config.HealthCheckConfig) *Checker {
 
 func (c *Checker) Start() {
 	go c.run()
-	log.Printf("[health] checker started (interval=%s, timeout=%s, unhealthy_after=%d failures)",
+	log.Printf("[health] checker started (interval=%s, tunnel_timeout=%s, unhealthy_after=%d failures)",
 		c.interval, c.timeout, maxConsecutiveFailures)
 }
 
@@ -56,7 +62,7 @@ func (c *Checker) Stop() {
 
 func (c *Checker) run() {
 	select {
-	case <-time.After(10 * time.Second):
+	case <-time.After(8 * time.Second):
 	case <-c.ctx.Done():
 		return
 	}
@@ -101,10 +107,29 @@ func (c *Checker) recordFailure(id int) int {
 }
 
 func (c *Checker) checkOne(inst *engine.Instance) {
-	var rtt time.Duration
-	var err error
+	// Step 1: Quick TCP connect — is the process even running?
+	conn, err := net.DialTimeout("tcp", inst.Addr(), 3*time.Second)
+	if err != nil {
+		// Process is not listening → immediately unhealthy
+		failCount := c.recordFailure(inst.ID())
+		if inst.State() != engine.StateUnhealthy {
+			log.Printf("[health] instance %d (%s:%d) UNHEALTHY: process not listening: %v",
+				inst.ID(), inst.Config.Domain, inst.Config.Port, err)
+			inst.SetState(engine.StateUnhealthy)
+			inst.SetLastPingMs(-1)
+			go func() {
+				log.Printf("[health] auto-restarting instance %d", inst.ID())
+				c.manager.RestartInstance(inst.ID())
+			}()
+		}
+		_ = failCount
+		return
+	}
+	conn.Close()
 
-	// Use per-instance mode for probe type
+	// Step 2: Tunnel probe — does the tunnel actually work?
+	// This sends data through the DNS tunnel and measures real RTT.
+	var rtt time.Duration
 	switch inst.Config.Mode {
 	case "ssh":
 		rtt, err = c.probeSSH(inst)
@@ -113,30 +138,28 @@ func (c *Checker) checkOne(inst *engine.Instance) {
 	}
 
 	if err != nil {
+		// Tunnel probe failed
 		failCount := c.recordFailure(inst.ID())
-
 		if failCount >= maxConsecutiveFailures {
 			if inst.State() != engine.StateUnhealthy {
-				log.Printf("[health] instance %d (%s:%d) UNHEALTHY after %d failures: %v",
+				log.Printf("[health] instance %d (%s:%d) UNHEALTHY after %d tunnel failures: %v",
 					inst.ID(), inst.Config.Domain, inst.Config.Port, failCount, err)
 				inst.SetState(engine.StateUnhealthy)
-
-				// Auto-restart: trigger restart for unhealthy instances
+				inst.SetLastPingMs(-1)
 				go func() {
-					log.Printf("[health] auto-restarting instance %d (%s:%d)",
-						inst.ID(), inst.Config.Domain, inst.Config.Port)
+					log.Printf("[health] auto-restarting instance %d", inst.ID())
 					c.manager.RestartInstance(inst.ID())
 				}()
 			}
-			inst.SetLastPingMs(-1)
 		} else {
-			log.Printf("[health] instance %d (%s:%d) probe failed (%d/%d): %v",
+			log.Printf("[health] instance %d (%s:%d) tunnel probe failed (%d/%d): %v",
 				inst.ID(), inst.Config.Domain, inst.Config.Port,
 				failCount, maxConsecutiveFailures, err)
 		}
 		return
 	}
 
+	// Tunnel probe succeeded → HEALTHY with real latency
 	c.recordSuccess(inst.ID())
 
 	pingMs := rtt.Milliseconds()
@@ -146,7 +169,7 @@ func (c *Checker) checkOne(inst *engine.Instance) {
 	inst.SetLastPingMs(pingMs)
 
 	if inst.State() != engine.StateHealthy {
-		log.Printf("[health] instance %d (%s:%d) now HEALTHY (ping=%dms)",
+		log.Printf("[health] instance %d (%s:%d) now HEALTHY (tunnel_rtt=%dms)",
 			inst.ID(), inst.Config.Domain, inst.Config.Port, pingMs)
 		inst.SetState(engine.StateHealthy)
 	}

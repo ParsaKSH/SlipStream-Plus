@@ -192,19 +192,25 @@ func (m *Manager) Shutdown() {
 func (m *Manager) Reload(cfg *config.Config) error {
 	log.Printf("[manager] reloading config...")
 
+	// IMPORTANT: cancel context FIRST so supervisor goroutines exit
+	// instead of trying to restart instances after we stop them.
+	m.cancel()
+
 	// Stop all current instances
 	for _, inst := range m.instances {
 		if err := inst.Stop(); err != nil {
 			log.Printf("[manager] error stopping instance %d during reload: %v", inst.ID(), err)
 		}
 	}
+
+	// Wait for all supervisor goroutines to exit
 	m.wg.Wait()
 
 	// Re-expand from new config
 	m.mu.Lock()
 	binary := cfg.SlipstreamBinary
 	if binary == "" {
-		binary = m.binary // keep embedded binary path
+		binary = m.binary
 	} else {
 		m.binary = binary
 	}
@@ -215,9 +221,8 @@ func (m *Manager) Reload(cfg *config.Config) error {
 		return fmt.Errorf("expand instances: %w", err)
 	}
 
-	// Reset context for new supervisors
+	// Create fresh context for new supervisors
 	ctx, cancel := context.WithCancel(context.Background())
-	m.cancel() // cancel old context
 	m.ctx = ctx
 	m.cancel = cancel
 
@@ -229,7 +234,6 @@ func (m *Manager) Reload(cfg *config.Config) error {
 
 	log.Printf("[manager] reload: %d instances expanded", len(expanded))
 
-	// Start all new instances
 	for _, inst := range m.instances {
 		if err := inst.Start(); err != nil {
 			log.Printf("[manager] reload: failed to start instance %d: %v", inst.ID(), err)

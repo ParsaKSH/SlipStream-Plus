@@ -19,9 +19,46 @@ type Config struct {
 }
 
 type SocksConfig struct {
-	Listen         string `json:"listen"`
-	BufferSize     int    `json:"buffer_size"`
-	MaxConnections int    `json:"max_connections"`
+	Listen         string       `json:"listen"`
+	BufferSize     int          `json:"buffer_size"`
+	MaxConnections int          `json:"max_connections"`
+	Users          []UserConfig `json:"users,omitempty"`
+}
+
+type UserConfig struct {
+	Username       string `json:"username"`
+	Password       string `json:"password"`
+	BandwidthLimit int    `json:"bandwidth_limit,omitempty"` // 0 = unlimited
+	BandwidthUnit  string `json:"bandwidth_unit,omitempty"`  // "kbit" or "mbit"
+	DataLimit      int    `json:"data_limit,omitempty"`      // 0 = unlimited
+	DataUnit       string `json:"data_unit,omitempty"`       // "mb" or "gb"
+	IPLimit        int    `json:"ip_limit,omitempty"`        // 0 = unlimited concurrent IPs
+}
+
+// BandwidthBytesPerSec returns the bandwidth limit in bytes/sec.
+func (u *UserConfig) BandwidthBytesPerSec() int64 {
+	if u.BandwidthLimit <= 0 {
+		return 0
+	}
+	switch u.BandwidthUnit {
+	case "mbit":
+		return int64(u.BandwidthLimit) * 1000 * 1000 / 8
+	default: // kbit
+		return int64(u.BandwidthLimit) * 1000 / 8
+	}
+}
+
+// DataLimitBytes returns the data limit in bytes.
+func (u *UserConfig) DataLimitBytes() int64 {
+	if u.DataLimit <= 0 {
+		return 0
+	}
+	switch u.DataUnit {
+	case "gb":
+		return int64(u.DataLimit) * 1024 * 1024 * 1024
+	default: // mb
+		return int64(u.DataLimit) * 1024 * 1024
+	}
 }
 
 type GUIConfig struct {

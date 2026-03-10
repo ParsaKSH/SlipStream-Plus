@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -117,7 +118,7 @@ func (s *SSHServer) getSSHClient(inst *engine.Instance) (*ssh.Client, error) {
 
 func (s *SSHServer) ListenAndServe() error {
 	lc := listenConfig()
-	ln, err := lc.Listen(nil, "tcp", s.listenAddr)
+	ln, err := lc.Listen(context.Background(), "tcp", s.listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.listenAddr, err)
 	}
@@ -251,22 +252,29 @@ func (s *SSHServer) handleConnection(clientConn net.Conn, connID uint64) {
 
 	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
+	var txN, rxN int64
 	done := make(chan struct{}, 2)
 	go func() {
 		bufPtr := s.bufPool.Get().(*[]byte)
-		io.CopyBuffer(upstreamConn, clientConn, *bufPtr)
+		n, _ := io.CopyBuffer(upstreamConn, clientConn, *bufPtr)
 		s.bufPool.Put(bufPtr)
+		txN = n
 		done <- struct{}{}
 	}()
 	go func() {
 		bufPtr := s.bufPool.Get().(*[]byte)
-		io.CopyBuffer(clientConn, upstreamConn, *bufPtr)
+		n, _ := io.CopyBuffer(clientConn, upstreamConn, *bufPtr)
 		s.bufPool.Put(bufPtr)
+		rxN = n
 		done <- struct{}{}
 	}()
 
 	<-done
 	<-done
+
+	// Track bandwidth per instance
+	inst.AddTx(txN)
+	inst.AddRx(rxN)
 }
 
 func (s *SSHServer) Close() {

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -44,7 +45,7 @@ func NewServer(listenAddr string, bufferSize int, maxConns int, mgr *engine.Mana
 func (s *Server) ListenAndServe() error {
 	lc := listenConfig()
 
-	ln, err := lc.Listen(nil, "tcp", s.listenAddr)
+	ln, err := lc.Listen(context.Background(), "tcp", s.listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.listenAddr, err)
 	}
@@ -154,6 +155,10 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 
 	<-done
 	<-done
+
+	// Track bandwidth per instance
+	inst.AddTx(clientToUpstream)
+	inst.AddRx(upstreamToClient)
 
 	log.Printf("[proxy] conn#%d: relay finished (c→u: %d bytes, u→c: %d bytes)",
 		connID, clientToUpstream, upstreamToClient)

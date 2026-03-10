@@ -46,6 +46,8 @@ type Instance struct {
 	cmd         *exec.Cmd
 	activeConns atomic.Int64
 	lastPingMs  atomic.Int64
+	txBytes     atomic.Int64 // total bytes uploaded (client → upstream)
+	rxBytes     atomic.Int64 // total bytes downloaded (upstream → client)
 	stopCh      chan struct{}
 	id          int
 }
@@ -67,6 +69,11 @@ func (inst *Instance) DecrConns()             { inst.activeConns.Add(-1) }
 func (inst *Instance) LastPingMs() int64      { return inst.lastPingMs.Load() }
 func (inst *Instance) SetLastPingMs(ms int64) { inst.lastPingMs.Store(ms) }
 func (inst *Instance) Addr() string           { return fmt.Sprintf("127.0.0.1:%d", inst.Config.Port) }
+
+func (inst *Instance) TxBytes() int64 { return inst.txBytes.Load() }
+func (inst *Instance) RxBytes() int64 { return inst.rxBytes.Load() }
+func (inst *Instance) AddTx(n int64)  { inst.txBytes.Add(n) }
+func (inst *Instance) AddRx(n int64)  { inst.rxBytes.Add(n) }
 
 func (inst *Instance) State() InstanceState {
 	inst.mu.RLock()
@@ -113,8 +120,6 @@ func (inst *Instance) Start() error {
 	}
 
 	cmd := exec.Command(inst.Binary, args...)
-
-	// Create a new process group so we can kill child + all descendants
 	cmd.SysProcAttr = procAttr()
 
 	stdout, err := cmd.StdoutPipe()
@@ -131,7 +136,7 @@ func (inst *Instance) Start() error {
 	}
 
 	inst.cmd = cmd
-	inst.state = StateHealthy // optimistic
+	inst.state = StateStarting // wait for health checker to verify
 
 	prefix := fmt.Sprintf("[instance-%d/%s:%d]", inst.id, inst.Config.Domain, inst.Config.Port)
 	log.Printf("%s started (pid=%d, mode=%s)", prefix, cmd.Process.Pid, inst.Config.Mode)
@@ -165,7 +170,6 @@ func (inst *Instance) Stop() error {
 
 	if inst.cmd != nil && inst.cmd.Process != nil {
 		pid := inst.cmd.Process.Pid
-		// Kill the entire process group (negative PID)
 		killProcessGroup(pid)
 		inst.cmd.Wait()
 	}
@@ -198,6 +202,8 @@ type StatusInfo struct {
 	State         string `json:"state"`
 	ActiveConns   int64  `json:"active_conns"`
 	LastPingMs    int64  `json:"last_ping_ms"`
+	TxBytes       int64  `json:"tx_bytes"`
+	RxBytes       int64  `json:"rx_bytes"`
 	OriginalIndex int    `json:"original_index"`
 	ReplicaIndex  int    `json:"replica_index"`
 }
@@ -212,6 +218,8 @@ func (inst *Instance) StatusInfo() StatusInfo {
 		State:         inst.State().String(),
 		ActiveConns:   inst.ActiveConns(),
 		LastPingMs:    inst.LastPingMs(),
+		TxBytes:       inst.TxBytes(),
+		RxBytes:       inst.RxBytes(),
 		OriginalIndex: inst.Config.OriginalIndex,
 		ReplicaIndex:  inst.Config.ReplicaIndex,
 	}
