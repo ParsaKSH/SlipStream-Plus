@@ -228,7 +228,18 @@ func (s *APIServer) handleRestart(w http.ResponseWriter, r *http.Request) {
 	// Schedule restart after response is sent
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		log.Printf("[gui] full restart requested, re-executing process...")
+		log.Printf("[gui] full restart requested, shutting down before re-exec...")
+
+		// Stop health checker first
+		if s.checker != nil {
+			s.checker.Stop()
+		}
+
+		// Shutdown manager — this kills all child processes and frees ports
+		s.manager.Shutdown()
+
+		time.Sleep(200 * time.Millisecond) // brief pause for port release
+
 		exe, err := os.Executable()
 		if err != nil {
 			log.Printf("[gui] restart failed: %v", err)

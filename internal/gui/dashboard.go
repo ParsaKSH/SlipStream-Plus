@@ -172,7 +172,10 @@ canvas{width:100%;height:200px;border-radius:var(--rs);background:var(--bg2);bor
     <div class="panel">
       <div class="section-hdr">
         <h3>Users</h3>
-        <button class="btn grn" onclick="openAddUser()">+ Add User</button>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="usr-search" placeholder="Search users..." oninput="filterUsers()" style="padding:5px 10px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--rs);color:var(--text);font:12px inherit;width:160px">
+          <button class="btn grn" onclick="openAddUser()">+ Add User</button>
+        </div>
       </div>
       <div class="tbl-wrap">
       <table><thead><tr>
@@ -270,31 +273,35 @@ async function fetchStatus(){
 }
 
 // ─── Users ───
-async function fetchUsers(){
-  try{
-    const r=await fetch('/api/users');const data=await r.json();
-    const tb=document.getElementById('usr-tbl'),nu=document.getElementById('no-users');
-    if(!data||data.length===0){tb.innerHTML='';nu.style.display='block';return}
-    nu.style.display='none';
-    tb.innerHTML=data.map(u=>{
-      const bw=u.bandwidth_limit>0?(u.bandwidth_limit+' '+u.bandwidth_unit):'∞';
-      const dl=u.data_limit>0?(u.data_limit+' '+u.data_unit):'∞';
-      const ip=u.ip_limit>0?u.ip_limit:'∞';
-      const pct=u.data_limit>0?Math.round(u.data_used_bytes/({gb:1073741824,mb:1048576}[u.data_unit]||1)/u.data_limit*100):0;
-      const bar=u.data_limit>0?'<div style="width:60px;height:4px;background:var(--bg4);border-radius:2px;margin-top:2px"><div style="width:'+Math.min(pct,100)+'%;height:100%;background:'+(pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--green)')+';border-radius:2px"></div></div>':'';
-      return '<tr>'+
-        '<td style="font-weight:600;color:var(--accent2)">'+esc(u.username)+'</td>'+
-        '<td>'+bw+'</td><td>'+dl+'</td>'+
-        '<td>'+fmt(u.data_used_bytes)+bar+'</td>'+
-        '<td>'+ip+'</td><td>'+u.active_ips+'</td>'+
-        '<td style="display:flex;gap:4px">'+
-          '<button class="btn sm" onclick="editUser(\''+esc(u.username)+'\')" title="Edit"><svg class="ico" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>'+
-          '<button class="btn sm red" onclick="deleteUser(\''+esc(u.username)+'\')" title="Delete"><svg class="ico" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>'+
-          '<button class="btn sm" onclick="resetUser(\''+esc(u.username)+'\')" title="Reset Data"><svg class="ico" viewBox="0 0 24 24"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg></button>'+
-        '</td></tr>';
-    }).join('');
-  }catch(e){}
+let cachedUsers=[];
+function renderUsers(data){
+  const tb=document.getElementById('usr-tbl'),nu=document.getElementById('no-users');
+  if(!data||data.length===0){tb.innerHTML='';nu.style.display='block';return}
+  nu.style.display='none';
+  const q=(document.getElementById('usr-search').value||'').toLowerCase();
+  const filtered=q?data.filter(u=>u.username.toLowerCase().includes(q)):data;
+  tb.innerHTML=filtered.map(u=>{
+    const bw=u.bandwidth_limit>0?(u.bandwidth_limit+' '+u.bandwidth_unit):'∞';
+    const dl=u.data_limit>0?(u.data_limit+' '+u.data_unit):'∞';
+    const ip=u.ip_limit>0?u.ip_limit:'∞';
+    const pct=u.data_limit>0?Math.round(u.data_used_bytes/({gb:1073741824,mb:1048576}[u.data_unit]||1)/u.data_limit*100):0;
+    const bar=u.data_limit>0?'<div style="width:60px;height:4px;background:var(--bg4);border-radius:2px;margin-top:2px"><div style="width:'+Math.min(pct,100)+'%;height:100%;background:'+(pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--green)')+';border-radius:2px"></div></div>':'';
+    return '<tr>'+
+      '<td style="font-weight:600;color:var(--accent2)">'+esc(u.username)+'</td>'+
+      '<td>'+bw+'</td><td>'+dl+'</td>'+
+      '<td>'+fmt(u.data_used_bytes)+bar+'</td>'+
+      '<td>'+ip+'</td><td>'+u.active_ips+'</td>'+
+      '<td style="display:flex;gap:4px">'+
+        '<button class="btn sm" onclick="editUser(\''+esc(u.username)+'\')" title="Edit"><svg class="ico" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>'+
+        '<button class="btn sm red" onclick="deleteUser(\''+esc(u.username)+'\')" title="Delete"><svg class="ico" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>'+
+        '<button class="btn sm" onclick="resetUser(\''+esc(u.username)+'\')" title="Reset Data"><svg class="ico" viewBox="0 0 24 24"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg></button>'+
+      '</td></tr>';
+  }).join('');
 }
+async function fetchUsers(){
+  try{const r=await fetch('/api/users');cachedUsers=await r.json();renderUsers(cachedUsers)}catch(e){}
+}
+function filterUsers(){renderUsers(cachedUsers)}
 
 // ─── User CRUD ───
 function openAddUser(){

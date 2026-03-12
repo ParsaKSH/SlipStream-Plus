@@ -23,38 +23,52 @@ type User struct {
 	usedBytes atomic.Int64 // total bytes consumed
 	dataLimit int64        // max bytes (0 = unlimited)
 
-	mu        sync.Mutex
-	activeIPs map[string]time.Time // IP → last-seen time
-	ipLimit   int                  // max concurrent IPs (0 = unlimited)
+	mu          sync.Mutex
+	activeIPs   map[string]int       // IP → active connection count
+	cooldownIPs map[string]time.Time // IP → disconnect time (for cooldown)
+	ipLimit     int                  // max concurrent IPs (0 = unlimited)
 }
 
 // Manager handles user auth, rate limiting, quotas, and connection limits.
 type Manager struct {
-	mu    sync.RWMutex
-	users map[string]*User // username → User
+	mu       sync.RWMutex
+	users    map[string]*User // username → User
+	ordering []string         // insertion order of usernames
 }
 
 // NewManager creates a UserManager from config.
 func NewManager(cfgUsers []config.UserConfig) *Manager {
 	m := &Manager{
-		users: make(map[string]*User, len(cfgUsers)),
+		users:    make(map[string]*User, len(cfgUsers)),
+		ordering: make([]string, 0, len(cfgUsers)),
 	}
 	for _, cu := range cfgUsers {
 		u := &User{
-			Config:    cu,
-			dataLimit: cu.DataLimitBytes(),
-			activeIPs: make(map[string]time.Time),
-			ipLimit:   cu.IPLimit,
+			Config:      cu,
+			dataLimit:   cu.DataLimitBytes(),
+			activeIPs:   make(map[string]int),
+			cooldownIPs: make(map[string]time.Time),
+			ipLimit:     cu.IPLimit,
 		}
 
 		// Setup bandwidth rate limiter
 		bps := cu.BandwidthBytesPerSec()
 		if bps > 0 {
-			// rate.Limit is events/sec; burst = 1 second worth of bytes
-			u.limiter = rate.NewLimiter(rate.Limit(bps), int(bps))
+			// burst = min(bps, 64KB) for smoother rate limiting
+			burst := int(bps)
+			if burst > 65536 {
+				burst = 65536
+			}
+			if burst < 4096 {
+				burst = 4096
+			}
+			u.limiter = rate.NewLimiter(rate.Limit(bps), burst)
+			log.Printf("[users] user %q: bandwidth limit %d %s (%d bytes/sec, burst=%d)",
+				cu.Username, cu.BandwidthLimit, cu.BandwidthUnit, bps, burst)
 		}
 
 		m.users[cu.Username] = u
+		m.ordering = append(m.ordering, cu.Username)
 	}
 
 	log.Printf("[users] loaded %d users", len(m.users))
@@ -81,7 +95,6 @@ func (m *Manager) Authenticate(username, password string) (*User, bool) {
 }
 
 // CheckConnect verifies a user can open a new connection from the given IP.
-// Returns an error string if denied, or "" if allowed.
 func (u *User) CheckConnect(clientIP string) string {
 	// Check data quota
 	if u.dataLimit > 0 && u.usedBytes.Load() >= u.dataLimit {
@@ -91,7 +104,7 @@ func (u *User) CheckConnect(clientIP string) string {
 
 	// Check IP limit
 	if u.ipLimit <= 0 {
-		return "" // no limit
+		return ""
 	}
 
 	u.mu.Lock()
@@ -100,21 +113,28 @@ func (u *User) CheckConnect(clientIP string) string {
 	now := time.Now()
 	cooldown := 10 * time.Second
 
-	// Clean up stale IPs (disconnected > 10s ago)
-	for ip, lastSeen := range u.activeIPs {
-		if now.Sub(lastSeen) > cooldown {
-			delete(u.activeIPs, ip)
+	// Clean up expired cooldowns
+	for ip, disconnectTime := range u.cooldownIPs {
+		if now.Sub(disconnectTime) > cooldown {
+			delete(u.cooldownIPs, ip)
 		}
 	}
 
-	// If this IP is already active, allow
-	if _, exists := u.activeIPs[clientIP]; exists {
+	// If this IP already has active connections, allow
+	if u.activeIPs[clientIP] > 0 {
 		return ""
 	}
 
-	// Check if we have room for a new IP
-	if len(u.activeIPs) >= u.ipLimit {
-		return fmt.Sprintf("ip limit reached (%d/%d active IPs)", len(u.activeIPs), u.ipLimit)
+	// If this IP is in cooldown, deny
+	if disconnectTime, inCooldown := u.cooldownIPs[clientIP]; inCooldown {
+		remaining := cooldown - now.Sub(disconnectTime)
+		return fmt.Sprintf("ip cooldown (%s remaining)", remaining.Round(time.Second))
+	}
+
+	// Count distinct active IPs
+	activeCount := len(u.activeIPs)
+	if activeCount >= u.ipLimit {
+		return fmt.Sprintf("ip limit reached (%d/%d active IPs)", activeCount, u.ipLimit)
 	}
 
 	return ""
@@ -122,21 +142,23 @@ func (u *User) CheckConnect(clientIP string) string {
 
 // MarkConnect records that a connection from this IP is active.
 func (u *User) MarkConnect(clientIP string) {
-	if u.ipLimit <= 0 {
-		return
-	}
 	u.mu.Lock()
-	u.activeIPs[clientIP] = time.Time{} // zero = still connected
+	u.activeIPs[clientIP]++
+	// Remove from cooldown if reconnecting
+	delete(u.cooldownIPs, clientIP)
 	u.mu.Unlock()
 }
 
-// MarkDisconnect records disconnection time for cooldown.
+// MarkDisconnect decrements active count; when zero, start cooldown.
 func (u *User) MarkDisconnect(clientIP string) {
-	if u.ipLimit <= 0 {
-		return
-	}
 	u.mu.Lock()
-	u.activeIPs[clientIP] = time.Now() // start cooldown countdown
+	u.activeIPs[clientIP]--
+	if u.activeIPs[clientIP] <= 0 {
+		delete(u.activeIPs, clientIP)
+		if u.ipLimit > 0 {
+			u.cooldownIPs[clientIP] = time.Now()
+		}
+	}
 	u.mu.Unlock()
 }
 
@@ -155,15 +177,15 @@ func (u *User) ResetUsedBytes() {
 	u.usedBytes.Store(0)
 }
 
-// WrapReader wraps a reader with rate limiting for this user.
+// WrapReader wraps a reader with rate limiting and byte tracking for this user.
 func (u *User) WrapReader(r io.Reader) io.Reader {
 	if u.limiter == nil {
-		return r
+		return &trackingReader{r: r, user: u}
 	}
 	return &rateLimitedReader{r: r, limiter: u.limiter, user: u}
 }
 
-// WrapWriter wraps a writer with rate limiting for this user.
+// WrapWriter wraps a writer with rate limiting and byte tracking for this user.
 func (u *User) WrapWriter(w io.Writer) io.Writer {
 	if u.limiter == nil {
 		return &trackingWriter{w: w, user: u}
@@ -171,13 +193,15 @@ func (u *User) WrapWriter(w io.Writer) io.Writer {
 	return &rateLimitedWriter{w: w, limiter: u.limiter, user: u}
 }
 
-// AllUsers returns all users with their stats.
+// AllUsers returns all users in config insertion order.
 func (m *Manager) AllUsers() []*User {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	result := make([]*User, 0, len(m.users))
-	for _, u := range m.users {
-		result = append(result, u)
+	result := make([]*User, 0, len(m.ordering))
+	for _, name := range m.ordering {
+		if u, ok := m.users[name]; ok {
+			result = append(result, u)
+		}
 	}
 	return result
 }
@@ -203,13 +227,7 @@ type UserStatus struct {
 
 func (u *User) Status() UserStatus {
 	u.mu.Lock()
-	activeCount := 0
-	now := time.Now()
-	for _, lastSeen := range u.activeIPs {
-		if lastSeen.IsZero() || now.Sub(lastSeen) <= 10*time.Second {
-			activeCount++
-		}
-	}
+	activeCount := len(u.activeIPs)
 	u.mu.Unlock()
 
 	return UserStatus{
@@ -233,15 +251,19 @@ type rateLimitedReader struct {
 }
 
 func (r *rateLimitedReader) Read(p []byte) (int, error) {
-	// Limit chunk size to burst size for smoother rate limiting
-	if r.limiter.Burst() > 0 && len(p) > r.limiter.Burst() {
-		p = p[:r.limiter.Burst()]
+	// Limit read size to burst for proper WaitN
+	burst := r.limiter.Burst()
+	if burst > 0 && len(p) > burst {
+		p = p[:burst]
 	}
 	n, err := r.r.Read(p)
 	if n > 0 {
 		r.user.AddUsedBytes(int64(n))
-		// Wait for tokens
-		r.limiter.WaitN(context.Background(), n)
+		// Block until tokens available — this creates backpressure
+		if waitErr := r.limiter.WaitN(context.Background(), n); waitErr != nil {
+			// If WaitN fails (shouldn't with Background()), sleep as fallback
+			time.Sleep(time.Duration(n) * time.Second / time.Duration(r.limiter.Limit()))
+		}
 	}
 	return n, err
 }
@@ -254,12 +276,16 @@ type rateLimitedWriter struct {
 
 func (w *rateLimitedWriter) Write(p []byte) (int, error) {
 	total := 0
+	burst := w.limiter.Burst()
 	for len(p) > 0 {
 		chunk := len(p)
-		if w.limiter.Burst() > 0 && chunk > w.limiter.Burst() {
-			chunk = w.limiter.Burst()
+		if burst > 0 && chunk > burst {
+			chunk = burst
 		}
-		w.limiter.WaitN(context.Background(), chunk)
+		// Wait BEFORE writing — this is the correct rate-limiting approach
+		if waitErr := w.limiter.WaitN(context.Background(), chunk); waitErr != nil {
+			time.Sleep(time.Duration(chunk) * time.Second / time.Duration(w.limiter.Limit()))
+		}
 		n, err := w.w.Write(p[:chunk])
 		total += n
 		if n > 0 {
@@ -271,6 +297,19 @@ func (w *rateLimitedWriter) Write(p []byte) (int, error) {
 		p = p[n:]
 	}
 	return total, nil
+}
+
+type trackingReader struct {
+	r    io.Reader
+	user *User
+}
+
+func (r *trackingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.user.AddUsedBytes(int64(n))
+	}
+	return n, err
 }
 
 type trackingWriter struct {
