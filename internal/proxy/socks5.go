@@ -242,47 +242,45 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 		tc.SetNoDelay(true)
 	}
 
-	// ──── SOCKS5 negotiation with upstream ────
-	// Greeting: no auth
-	upstreamConn.Write([]byte{0x05, 0x01, 0x00})
-	greetResp := make([]byte, 2)
-	if _, err := io.ReadFull(upstreamConn, greetResp); err != nil {
+	// ──── Pipelined SOCKS5 negotiation with upstream ────
+	// Combine greeting + CONNECT into ONE write to minimize DNS tunnel round-trips.
+	// Greeting: VER=5, NMETHODS=1, METHOD=0x00 (no auth)
+	// CONNECT:  VER=5, CMD=1, RSV=0, ATYP, ADDR, PORT
+	pipelined := make([]byte, 0, 3+4+len(addrBytes)+2)
+	pipelined = append(pipelined, 0x05, 0x01, 0x00)       // greeting
+	pipelined = append(pipelined, 0x05, 0x01, 0x00, atyp) // CONNECT header
+	pipelined = append(pipelined, addrBytes...)           // target addr
+	pipelined = append(pipelined, portBytes...)           // target port
+	if _, err := upstreamConn.Write(pipelined); err != nil {
 		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 
-	// CONNECT: replay the same target address
-	connectReq := make([]byte, 0, 4+len(addrBytes)+2)
-	connectReq = append(connectReq, 0x05, 0x01, 0x00, atyp)
-	connectReq = append(connectReq, addrBytes...)
-	connectReq = append(connectReq, portBytes...)
-	upstreamConn.Write(connectReq)
-
-	// Read upstream CONNECT reply (at least 4 bytes header)
-	connectResp := make([]byte, 4)
-	if _, err := io.ReadFull(upstreamConn, connectResp); err != nil {
+	// Read greeting response (2 bytes) + CONNECT response header (4 bytes) = 6 bytes
+	resp := make([]byte, 6)
+	if _, err := io.ReadFull(upstreamConn, resp); err != nil {
 		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
+	// resp[0..1] = greeting reply, resp[2..5] = CONNECT reply header
 
-	// Read the rest of the reply (bind addr + port)
-	repAtyp := connectResp[3]
+	// Drain the CONNECT reply's bind address + port
+	repAtyp := resp[5]
 	switch repAtyp {
 	case 0x01:
-		io.ReadFull(upstreamConn, make([]byte, 4+2)) // IPv4 + port
+		io.ReadFull(upstreamConn, make([]byte, 4+2))
 	case 0x03:
 		lenBuf := make([]byte, 1)
 		io.ReadFull(upstreamConn, lenBuf)
 		io.ReadFull(upstreamConn, make([]byte, int(lenBuf[0])+2))
 	case 0x04:
-		io.ReadFull(upstreamConn, make([]byte, 16+2)) // IPv6 + port
+		io.ReadFull(upstreamConn, make([]byte, 16+2))
 	default:
-		io.ReadFull(upstreamConn, make([]byte, 4+2)) // fallback
+		io.ReadFull(upstreamConn, make([]byte, 4+2))
 	}
 
-	if connectResp[1] != 0x00 {
-		// Upstream refused
-		clientConn.Write([]byte{0x05, connectResp[1], 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	if resp[3] != 0x00 { // CONNECT reply status
+		clientConn.Write([]byte{0x05, resp[3], 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 
