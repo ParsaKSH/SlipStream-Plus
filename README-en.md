@@ -26,6 +26,13 @@ You can operate this core either on remote servers that have fast connections br
 
 SlipStream-Plus comes configured automatically with a lightweight, modern, and dark-themed responsive UI for maximum operability while online.
 
+<p align="center">
+  <img src="screenshots/1-instances.jpg" width="48%" />
+  <img src="screenshots/4-config.jpg" width="48%" />
+  <img src="screenshots/3-users.jpg" width="48%" />
+  <img src="screenshots/2-bandwidth.jpg" width="48%" />
+</p>
+
 **Panel Highlights:**
 - **🎛️ Dashboard:** High-level metrics showing total connections, running instances, and proxy status.
 - **🛰️ Instances Tab:** 

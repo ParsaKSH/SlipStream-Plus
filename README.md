@@ -26,6 +26,13 @@
 
 SlipStream-Plus دارای یک پنل وب با معماری بسیار سبک و مدرن (طراحی تاریک و واکنش‌گرا) برای کنترل کامل برنامه در حین اجراست.
 
+<p align="center">
+  <img src="screenshots/1-instances.jpg" width="48%" />
+  <img src="screenshots/4-config.jpg" width="48%" />
+  <img src="screenshots/3-users.jpg" width="48%" />
+  <img src="screenshots/2-bandwidth.jpg" width="48%" />
+</p>
+
 **امکانات پنل مرورگر:**
 - **🎛️ داشبورد:** مشاهده وضعیت کلی اتصال‌ها، کاربران سالم، و پهنای‌باند.
 - **🛰️ تب Instances (سرورها):** 
