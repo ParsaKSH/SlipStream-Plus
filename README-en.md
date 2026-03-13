@@ -2,7 +2,7 @@
 
 [Persian (فارسی)](README.md)
 
-SlipStream-Plus is a **Load Balancer** and **Advanced Management Panel** built on top of the powerful [Slipstream-Rust](https://github.com/mmb0/slipstream-rust) DNS tunnel core. This software natively embeds the core binary allowing you to manage multi-client connections, multi-user definitions, graphical monitoring, and bandwidth caps seamlessly.
+SlipStream-Plus is a **Load Balancer** and **Advanced Management Panel** built on top of the powerful [Slipstream-Rust](https://github.com/Mygod/slipstream-rust) DNS tunnel core. This software natively embeds the core binary allowing you to manage multi-client connections, multi-user definitions, graphical monitoring, and bandwidth caps seamlessly.
 
 This project enables you to run multiple SlipStream configurations concurrently. The active traffic bounds are automatically load-balanced across your instances which significantly increases overall connection quality and throughput speeds.
 
