@@ -71,7 +71,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -ldflags
 
 ```json
 {
-  "strategy": "round_robin",
+  "strategy": "least_load",
   "gui": {
     "enabled": true,
     "listen": "0.0.0.0:8484",
@@ -80,12 +80,12 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -ldflags
   },
   "health_check": {
     "interval": "30s",
-    "target": "1.1.1.1:53",
+    "target": "google.com",
     "timeout": "10s"
   },
   "socks": {
-    "listen": "0.0.0.0:1082",
-    "buffer_size": 131072,
+    "listen": "0.0.0.0:1080",
+    "buffer_size": 65536,
     "max_connections": 10000,
     "users": [
       {
@@ -103,7 +103,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -ldflags
     {
       "domain": "example.com",
       "resolver": "8.8.8.8",
-      "port": "17001-17004",
+      "port": "17001",
       "mode": "socks",
       "replicas": 1
     }
@@ -154,4 +154,7 @@ If this repository assisted your networking goals, please consider leaving a Sta
 
 ---
 
-Wishing prosperity and success to you! 🚀✨
+Developed with the help of **Claude Opus 4.6**
+
+Wishing prosperity for an ever-growing Iran... 
+And success for you! 🚀✨
