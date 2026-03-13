@@ -1,0 +1,41 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Build Linux (amd64)
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embed_slipstream -ldflags="-s -w" -o slipstreamplus-linux-amd64 ./cmd/slipstreamplus
+
+      - name: Build Windows (amd64)
+        run: |
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -ldflags="-s -w" -o slipstreamplus-windows-amd64.exe ./cmd/slipstreamplus
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            slipstreamplus-linux-amd64
+            slipstreamplus-windows-amd64.exe
+          generate_release_notes: true

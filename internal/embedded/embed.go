@@ -6,15 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-)
 
-// BinaryData holds the embedded slipstream-client binary.
-// Set via go:embed in embed_binary.go (build tag: embed_slipstream)
-var BinaryData []byte
+	"github.com/ParsaKSH/SlipStream-Plus/slipstreamorg"
+)
 
 // IsEmbedded returns true if the slipstream binary is embedded.
 func IsEmbedded() bool {
-	return len(BinaryData) > 0
+	return len(slipstreamorg.BinaryData) > 0
 }
 
 // ExtractBinary extracts the embedded binary to a temp directory
@@ -39,11 +37,11 @@ func ExtractBinary() (string, func(), error) {
 	}
 
 	binPath := filepath.Join(tmpDir, name)
-	if err := os.WriteFile(binPath, BinaryData, 0755); err != nil {
+	if err := os.WriteFile(binPath, slipstreamorg.BinaryData, 0755); err != nil {
 		cleanup()
 		return "", func() {}, fmt.Errorf("write binary: %w", err)
 	}
 
-	log.Printf("[embedded] extracted slipstream-client to %s (%d bytes)", binPath, len(BinaryData))
+	log.Printf("[embedded] extracted slipstream-client to %s (%d bytes)", binPath, len(slipstreamorg.BinaryData))
 	return binPath, cleanup, nil
 }

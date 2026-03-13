@@ -1,0 +1,36 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Verify formatting
+        run: go fmt ./...
+
+      - name: Build without embed (Linux)
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v ./cmd/slipstreamplus
+
+      - name: Build without embed (Windows)
+        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -v ./cmd/slipstreamplus
+
+      - name: Build with embed (Linux)
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embed_slipstream -v ./cmd/slipstreamplus
+
+      - name: Build with embed (Windows)
+        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -v ./cmd/slipstreamplus
