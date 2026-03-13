@@ -73,7 +73,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -ldflags
 
 ```json
 {
-  "strategy": "round_robin",
+  "strategy": "least_load",
   "gui": {
     "enabled": true,
     "listen": "0.0.0.0:8484",
@@ -82,12 +82,12 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -ldflags
   },
   "health_check": {
     "interval": "30s",
-    "target": "1.1.1.1:53",
+    "target": "google.com",
     "timeout": "10s"
   },
   "socks": {
-    "listen": "0.0.0.0:1082",
-    "buffer_size": 131072,
+    "listen": "0.0.0.0:1080",
+    "buffer_size": 65536,
     "max_connections": 10000,
     "users": [
       {
@@ -105,7 +105,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -ldflags
     {
       "domain": "example.com",
       "resolver": "8.8.8.8",
-      "port": "17001-17004",
+      "port": "17001",
       "mode": "socks",
       "replicas": 1
     }
@@ -155,6 +155,8 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -ldflags
 اگر این پروژه برایتان مفید بود، خوشحال می‌شوم به آن ستاره بدهید. این باعث می‌شود افراد بیشتری از آن استفاده کنند.
 
 ---
+
+توسعه داده شده به کمک claude opus 4.6
 
 به امید سربلندی ایران آباد... 
 با آرزوی پیروزی برای شما 🚀✨
