@@ -158,5 +158,5 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -ldflags
 
 توسعه داده شده به کمک claude opus 4.6
 
-به امید سربلندی ایران آباد... 
+به امید آزادی ایران... 
 با آرزوی پیروزی برای شما 🚀✨

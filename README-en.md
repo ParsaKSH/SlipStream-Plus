@@ -156,5 +156,5 @@ If this repository assisted your networking goals, please consider leaving a Sta
 
 Developed with the help of **Claude Opus 4.6**
 
-Wishing prosperity for an ever-growing Iran... 
+Wishing freedom for IRAN... 
 And success for you! 🚀✨
