@@ -58,16 +58,20 @@ jobs:
 
     steps:
       - name: Clone slipstream-rust
-        run: git clone --depth 1 https://github.com/Mygod/slipstream-rust.git
+        run: git clone --depth 1 --recurse-submodules https://github.com/Mygod/slipstream-rust.git
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_target }}
 
-      - name: Install musl-tools (Linux amd64 native)
-        if: matrix.name == 'linux-amd64'
-        run: sudo apt-get update -qq && sudo apt-get install -y musl-tools
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake musl-tools
+
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake
 
       - name: Install cross
         if: matrix.use_cross
@@ -76,12 +80,12 @@ jobs:
       - name: Build with cross
         if: matrix.use_cross
         working-directory: slipstream-rust
-        run: cross build --release --target ${{ matrix.rust_target }} -p slipstream-client --features openssl-vendored
+        run: cross build --release --target ${{ matrix.rust_target }} -p slipstream-client --features openssl-vendored,picoquic-minimal-build
 
       - name: Build with cargo (native)
         if: "!matrix.use_cross"
         working-directory: slipstream-rust
-        run: cargo build --release --target ${{ matrix.rust_target }} -p slipstream-client --features openssl-vendored
+        run: cargo build --release --target ${{ matrix.rust_target }} -p slipstream-client --features openssl-vendored,picoquic-minimal-build
 
       - name: Prepare artifact
         run: |
