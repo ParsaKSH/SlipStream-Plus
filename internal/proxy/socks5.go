@@ -88,6 +88,8 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
 		tc.SetNoDelay(true)
+		tc.SetReadBuffer(s.bufferSize)
+		tc.SetWriteBuffer(s.bufferSize)
 	}
 
 	clientIP := users.ExtractIP(clientConn.RemoteAddr())
@@ -240,6 +242,8 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
 		tc.SetNoDelay(true)
+		tc.SetReadBuffer(s.bufferSize)
+		tc.SetWriteBuffer(s.bufferSize)
 	}
 
 	// ──── Pipelined SOCKS5 negotiation with upstream ────
