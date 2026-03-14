@@ -7,9 +7,170 @@ on:
   pull_request:
 
 jobs:
-  test:
-    name: Run Tests
+  # ──────────────────────────────────────────────
+  # Step 1: Build Rust core for all platforms
+  # ──────────────────────────────────────────────
+  build-rust:
+    name: Build Rust Core (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+            binary: slipstream-client-linux-amd64
+            ext: ""
+          - name: linux-arm64
+            os: ubuntu-latest
+            rust_target: aarch64-unknown-linux-musl
+            binary: slipstream-client-linux-arm64
+            ext: ""
+          - name: windows-amd64
+            os: ubuntu-latest
+            rust_target: x86_64-pc-windows-gnu
+            binary: slipstream-client.exe
+            ext: ".exe"
+          - name: windows-arm64
+            os: ubuntu-latest
+            rust_target: aarch64-pc-windows-gnullvm
+            binary: slipstream-client-windows-arm64.exe
+            ext: ".exe"
+          - name: darwin-amd64
+            os: macos-13
+            rust_target: x86_64-apple-darwin
+            binary: slipstream-client-darwin-amd64
+            ext: ""
+          - name: darwin-arm64
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            binary: slipstream-client-darwin-arm64
+            ext: ""
+          - name: freebsd-amd64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-freebsd
+            binary: slipstream-client-freebsd-amd64
+            ext: ""
+          - name: openbsd-amd64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-openbsd
+            binary: slipstream-client-openbsd-amd64
+            ext: ""
+
+    steps:
+      - name: Clone slipstream-rust
+        run: git clone --depth 1 https://github.com/Mygod/slipstream-rust.git
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install cross-compilation tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          case "${{ matrix.rust_target }}" in
+            aarch64-unknown-linux-musl)
+              sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+              ;;
+            x86_64-unknown-linux-musl)
+              sudo apt-get install -y musl-tools
+              ;;
+            x86_64-pc-windows-gnu)
+              sudo apt-get install -y gcc-mingw-w64-x86-64
+              ;;
+            x86_64-unknown-freebsd|x86_64-unknown-openbsd)
+              cargo install cross --git https://github.com/cross-rs/cross
+              ;;
+          esac
+
+      - name: Build Rust binary
+        working-directory: slipstream-rust
+        run: |
+          case "${{ matrix.rust_target }}" in
+            x86_64-unknown-freebsd|x86_64-unknown-openbsd)
+              cross build --release --target ${{ matrix.rust_target }}
+              ;;
+            aarch64-unknown-linux-musl)
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+              export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
+              cargo build --release --target ${{ matrix.rust_target }}
+              ;;
+            *)
+              cargo build --release --target ${{ matrix.rust_target }}
+              ;;
+          esac
+
+      - name: Prepare artifact
+        run: |
+          SRC="slipstream-rust/target/${{ matrix.rust_target }}/release/slipstream-client${{ matrix.ext }}"
+          if [ ! -f "$SRC" ]; then
+            SRC=$(find slipstream-rust/target/${{ matrix.rust_target }}/release/ -maxdepth 1 -name "slipstream*" -type f ! -name "*.d" ! -name "*.rlib" | head -1)
+          fi
+          cp "$SRC" "${{ matrix.binary }}"
+          chmod +x "${{ matrix.binary }}" || true
+
+      - name: Upload Rust binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-${{ matrix.name }}
+          path: ${{ matrix.binary }}
+          retention-days: 1
+
+  # ──────────────────────────────────────────────
+  # Step 2: Test Go builds (with and without embed) for all platforms
+  # ──────────────────────────────────────────────
+  test-go:
+    name: Test Go (${{ matrix.name }})
     runs-on: ubuntu-latest
+    needs: build-rust
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            goos: linux
+            goarch: amd64
+            rust_artifact: rust-linux-amd64
+            rust_binary: slipstream-client-linux-amd64
+          - name: linux-arm64
+            goos: linux
+            goarch: arm64
+            rust_artifact: rust-linux-arm64
+            rust_binary: slipstream-client-linux-arm64
+          - name: windows-amd64
+            goos: windows
+            goarch: amd64
+            rust_artifact: rust-windows-amd64
+            rust_binary: slipstream-client.exe
+          - name: windows-arm64
+            goos: windows
+            goarch: arm64
+            rust_artifact: rust-windows-arm64
+            rust_binary: slipstream-client-windows-arm64.exe
+          - name: darwin-amd64
+            goos: darwin
+            goarch: amd64
+            rust_artifact: rust-darwin-amd64
+            rust_binary: slipstream-client-darwin-amd64
+          - name: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            rust_artifact: rust-darwin-arm64
+            rust_binary: slipstream-client-darwin-arm64
+          - name: freebsd-amd64
+            goos: freebsd
+            goarch: amd64
+            rust_artifact: rust-freebsd-amd64
+            rust_binary: slipstream-client-freebsd-amd64
+          - name: openbsd-amd64
+            goos: openbsd
+            goarch: amd64
+            rust_artifact: rust-openbsd-amd64
+            rust_binary: slipstream-client-openbsd-amd64
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -21,16 +182,19 @@ jobs:
           check-latest: true
 
       - name: Verify formatting
-        run: go fmt ./...
+        run: test -z "$(gofmt -l ./...)"
 
-      - name: Build without embed (Linux)
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v ./cmd/slipstreamplus
+      - name: Build without embed
+        run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -v ./cmd/slipstreamplus
 
-      - name: Build without embed (Windows)
-        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -v ./cmd/slipstreamplus
+      - name: Download Rust binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.rust_artifact }}
+          path: slipstreamorg/
 
-      - name: Build with embed (Linux)
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embed_slipstream -v ./cmd/slipstreamplus
-
-      - name: Build with embed (Windows)
-        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -v ./cmd/slipstreamplus
+      - name: Build with embed
+        run: |
+          ls -la slipstreamorg/
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -tags embed_slipstream -v ./cmd/slipstreamplus
