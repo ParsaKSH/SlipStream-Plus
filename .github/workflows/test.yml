@@ -74,9 +74,22 @@ jobs:
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
+      - name: Configure cross for musl
+        if: matrix.use_cross
+        working-directory: slipstream-rust
+        run: |
+          cat > Cross.toml << 'EOF'
+          [build.env]
+          passthrough = ["CFLAGS", "CXXFLAGS", "CMAKE_C_FLAGS"]
+          EOF
+
       - name: Build with cross
         if: matrix.use_cross
         working-directory: slipstream-rust
+        env:
+          CFLAGS: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+          CXXFLAGS: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+          CMAKE_C_FLAGS: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
         run: cross build --release --target ${{ matrix.rust_target }} -p slipstream-client --features openssl-vendored,picoquic-minimal-build
 
       - name: Build with cargo (native)
