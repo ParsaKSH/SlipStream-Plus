@@ -313,29 +313,37 @@ func (s *SSHServer) handleConnection(clientConn net.Conn, connID uint64) {
 
 	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-	// Relay with rate limiting
+	// Relay with rate limiting or zero-copy
+	needsWrap := user != nil && user.NeedsRateLimit()
+
 	var txN, rxN int64
 	done := make(chan struct{}, 2)
 	go func() {
-		var src io.Reader = clientConn
-		if user != nil {
-			src = user.WrapReader(src)
+		if needsWrap {
+			src := user.WrapReader(clientConn)
+			bufPtr := s.bufPool.Get().(*[]byte)
+			n, _ := io.CopyBuffer(upstreamConn, src, *bufPtr)
+			s.bufPool.Put(bufPtr)
+			txN = n
+		} else {
+			// Zero-copy path (splice on Linux)
+			n, _ := io.Copy(upstreamConn, clientConn)
+			txN = n
 		}
-		bufPtr := s.bufPool.Get().(*[]byte)
-		n, _ := io.CopyBuffer(upstreamConn, src, *bufPtr)
-		s.bufPool.Put(bufPtr)
-		txN = n
 		done <- struct{}{}
 	}()
 	go func() {
-		var dst io.Writer = clientConn
-		if user != nil {
-			dst = user.WrapWriter(dst)
+		if needsWrap {
+			dst := user.WrapWriter(clientConn)
+			bufPtr := s.bufPool.Get().(*[]byte)
+			n, _ := io.CopyBuffer(dst, upstreamConn, *bufPtr)
+			s.bufPool.Put(bufPtr)
+			rxN = n
+		} else {
+			// Zero-copy path
+			n, _ := io.Copy(clientConn, upstreamConn)
+			rxN = n
 		}
-		bufPtr := s.bufPool.Get().(*[]byte)
-		n, _ := io.CopyBuffer(dst, upstreamConn, *bufPtr)
-		s.bufPool.Put(bufPtr)
-		rxN = n
 		done <- struct{}{}
 	}()
 
@@ -344,6 +352,11 @@ func (s *SSHServer) handleConnection(clientConn net.Conn, connID uint64) {
 
 	inst.AddTx(txN)
 	inst.AddRx(rxN)
+
+	// Track bytes for user data quota (non-rate-limited path)
+	if user != nil && !needsWrap {
+		user.AddUsedBytes(txN + rxN)
+	}
 }
 
 func (s *SSHServer) Close() {

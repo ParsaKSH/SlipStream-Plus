@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -294,26 +293,31 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 	inst.IncrConns()
 	defer inst.DecrConns()
 
-	port := binary.BigEndian.Uint16(portBytes)
-	log.Printf("[proxy] conn#%d: connected via instance %d, port %d", connID, inst.ID(), port)
-
-	s.relay(clientConn, upstreamConn, inst, user, connID)
+	s.relay(clientConn, upstreamConn, inst, user)
 }
 
-func (s *Server) relay(clientConn, upstreamConn net.Conn, inst *engine.Instance, user *users.User, connID uint64) {
+func (s *Server) relay(clientConn, upstreamConn net.Conn, inst *engine.Instance, user *users.User) {
+	// Determine if we need rate-limited (wrapped) relay or can use zero-copy.
+	// When user is nil or has no bandwidth limiter, io.Copy between raw
+	// net.TCPConns triggers Linux splice(2) — zero-copy kernel-to-kernel transfer.
+	// This dramatically reduces CPU usage and latency under high load.
+	needsWrap := user != nil && user.NeedsRateLimit()
+
 	var clientToUpstream, upstreamToClient int64
 	done := make(chan struct{}, 2)
 
 	go func() {
-		var dst io.Writer = upstreamConn
-		var src io.Reader = clientConn
-		if user != nil {
-			src = user.WrapReader(src)
+		if needsWrap {
+			src := user.WrapReader(clientConn)
+			bufPtr := s.bufPool.Get().(*[]byte)
+			n, _ := io.CopyBuffer(upstreamConn, src, *bufPtr)
+			s.bufPool.Put(bufPtr)
+			clientToUpstream = n
+		} else {
+			// Zero-copy path: io.Copy on raw TCP conns uses splice(2) on Linux
+			n, _ := io.Copy(upstreamConn, clientConn)
+			clientToUpstream = n
 		}
-		bufPtr := s.bufPool.Get().(*[]byte)
-		n, _ := io.CopyBuffer(dst, src, *bufPtr)
-		s.bufPool.Put(bufPtr)
-		clientToUpstream = n
 		if tc, ok := upstreamConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -321,15 +325,17 @@ func (s *Server) relay(clientConn, upstreamConn net.Conn, inst *engine.Instance,
 	}()
 
 	go func() {
-		var dst io.Writer = clientConn
-		var src io.Reader = upstreamConn
-		if user != nil {
-			dst = user.WrapWriter(dst)
+		if needsWrap {
+			dst := user.WrapWriter(clientConn)
+			bufPtr := s.bufPool.Get().(*[]byte)
+			n, _ := io.CopyBuffer(dst, upstreamConn, *bufPtr)
+			s.bufPool.Put(bufPtr)
+			upstreamToClient = n
+		} else {
+			// Zero-copy path
+			n, _ := io.Copy(clientConn, upstreamConn)
+			upstreamToClient = n
 		}
-		bufPtr := s.bufPool.Get().(*[]byte)
-		n, _ := io.CopyBuffer(dst, src, *bufPtr)
-		s.bufPool.Put(bufPtr)
-		upstreamToClient = n
 		if tc, ok := clientConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -341,6 +347,12 @@ func (s *Server) relay(clientConn, upstreamConn net.Conn, inst *engine.Instance,
 
 	inst.AddTx(clientToUpstream)
 	inst.AddRx(upstreamToClient)
+
+	// Track bytes for user (data quota) — counted from io.Copy return values
+	// so we don't need wrapper overhead for non-rate-limited users.
+	if user != nil && !needsWrap {
+		user.AddUsedBytes(clientToUpstream + upstreamToClient)
+	}
 }
 
 func (s *Server) ActiveConnections() int64 {

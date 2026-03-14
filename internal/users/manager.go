@@ -177,6 +177,12 @@ func (u *User) ResetUsedBytes() {
 	u.usedBytes.Store(0)
 }
 
+// NeedsRateLimit returns true if this user has an active bandwidth limiter.
+// When false, the proxy can use zero-copy (splice) relay for much better performance.
+func (u *User) NeedsRateLimit() bool {
+	return u.limiter != nil
+}
+
 // WrapReader wraps a reader with rate limiting and byte tracking for this user.
 func (u *User) WrapReader(r io.Reader) io.Reader {
 	if u.limiter == nil {
