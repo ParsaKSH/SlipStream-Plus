@@ -14,7 +14,7 @@ jobs:
   # Step 1: Build slipstream-rust core for all platforms
   # ──────────────────────────────────────────────
   build-rust:
-    name: Build Rust Core (${{ matrix.name }})
+    name: Rust Core (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -24,42 +24,37 @@ jobs:
             os: ubuntu-latest
             rust_target: x86_64-unknown-linux-musl
             binary: slipstream-client-linux-amd64
-            ext: ""
+            use_cross: false
           - name: linux-arm64
             os: ubuntu-latest
             rust_target: aarch64-unknown-linux-musl
             binary: slipstream-client-linux-arm64
-            ext: ""
+            use_cross: true
           - name: windows-amd64
             os: ubuntu-latest
             rust_target: x86_64-pc-windows-gnu
             binary: slipstream-client.exe
-            ext: ".exe"
-          - name: windows-arm64
-            os: ubuntu-latest
-            rust_target: aarch64-pc-windows-gnullvm
-            binary: slipstream-client-windows-arm64.exe
-            ext: ".exe"
+            use_cross: true
           - name: darwin-amd64
             os: macos-13
             rust_target: x86_64-apple-darwin
             binary: slipstream-client-darwin-amd64
-            ext: ""
+            use_cross: false
           - name: darwin-arm64
             os: macos-14
             rust_target: aarch64-apple-darwin
             binary: slipstream-client-darwin-arm64
-            ext: ""
+            use_cross: false
           - name: freebsd-amd64
             os: ubuntu-latest
             rust_target: x86_64-unknown-freebsd
             binary: slipstream-client-freebsd-amd64
-            ext: ""
+            use_cross: true
           - name: openbsd-amd64
             os: ubuntu-latest
             rust_target: x86_64-unknown-openbsd
             binary: slipstream-client-openbsd-amd64
-            ext: ""
+            use_cross: true
 
     steps:
       - name: Clone slipstream-rust
@@ -70,52 +65,31 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
-      - name: Install cross-compilation tools (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -qq
-          case "${{ matrix.rust_target }}" in
-            aarch64-unknown-linux-musl)
-              sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
-              ;;
-            x86_64-unknown-linux-musl)
-              sudo apt-get install -y musl-tools
-              ;;
-            x86_64-pc-windows-gnu)
-              sudo apt-get install -y gcc-mingw-w64-x86-64
-              ;;
-            x86_64-unknown-freebsd|x86_64-unknown-openbsd)
-              cargo install cross --git https://github.com/cross-rs/cross
-              ;;
-          esac
+      - name: Install musl-tools (Linux amd64 native)
+        if: matrix.name == 'linux-amd64'
+        run: sudo apt-get update -qq && sudo apt-get install -y musl-tools
 
-      - name: Build Rust binary
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        if: matrix.use_cross
         working-directory: slipstream-rust
-        run: |
-          case "${{ matrix.rust_target }}" in
-            x86_64-unknown-freebsd|x86_64-unknown-openbsd)
-              cross build --release --target ${{ matrix.rust_target }}
-              ;;
-            aarch64-unknown-linux-musl)
-              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
-              export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
-              cargo build --release --target ${{ matrix.rust_target }}
-              ;;
-            *)
-              cargo build --release --target ${{ matrix.rust_target }}
-              ;;
-          esac
+        run: cross build --release --target ${{ matrix.rust_target }} -p slipstream-client --features openssl-vendored
+
+      - name: Build with cargo (native)
+        if: "!matrix.use_cross"
+        working-directory: slipstream-rust
+        run: cargo build --release --target ${{ matrix.rust_target }} -p slipstream-client --features openssl-vendored
 
       - name: Prepare artifact
         run: |
-          SRC="slipstream-rust/target/${{ matrix.rust_target }}/release/slipstream-client${{ matrix.ext }}"
-          # For Windows targets, the binary name may be slipstream-client.exe
-          if [ ! -f "$SRC" ]; then
-            # Try alternate name patterns
-            SRC=$(find slipstream-rust/target/${{ matrix.rust_target }}/release/ -maxdepth 1 -name "slipstream*" -type f ! -name "*.d" ! -name "*.rlib" | head -1)
-          fi
+          # Find built binary
+          find slipstream-rust/target/${{ matrix.rust_target }}/release/ -maxdepth 1 -name "slipstream-client*" -type f ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" | head -5
+          SRC=$(find slipstream-rust/target/${{ matrix.rust_target }}/release/ -maxdepth 1 \( -name "slipstream-client" -o -name "slipstream-client.exe" \) -type f | head -1)
           cp "$SRC" "${{ matrix.binary }}"
-          chmod +x "${{ matrix.binary }}" || true
+          chmod +x "${{ matrix.binary }}" 2>/dev/null || true
           ls -la "${{ matrix.binary }}"
 
       - name: Upload Rust binary
@@ -129,7 +103,7 @@ jobs:
   # Step 2: Build Go binaries with embedded Rust core
   # ──────────────────────────────────────────────
   build-go:
-    name: Build Go (${{ matrix.name }})
+    name: Go Build (${{ matrix.name }})
     runs-on: ubuntu-latest
     needs: build-rust
     strategy:
@@ -154,12 +128,6 @@ jobs:
             rust_artifact: rust-windows-amd64
             rust_binary: slipstream-client.exe
             output: slipstreamplus-windows-amd64.exe
-          - name: windows-arm64
-            goos: windows
-            goarch: arm64
-            rust_artifact: rust-windows-arm64
-            rust_binary: slipstream-client-windows-arm64.exe
-            output: slipstreamplus-windows-arm64.exe
           - name: darwin-amd64
             goos: darwin
             goarch: amd64
@@ -202,9 +170,7 @@ jobs:
           path: slipstreamorg/
 
       - name: Verify embedded binary
-        run: |
-          ls -la slipstreamorg/
-          file slipstreamorg/${{ matrix.rust_binary }} || true
+        run: ls -la slipstreamorg/
 
       - name: Build Go binary
         run: |
@@ -220,7 +186,7 @@ jobs:
           retention-days: 1
 
   # ──────────────────────────────────────────────
-  # Step 3: Publish all binaries as a GitHub Release
+  # Step 3: Publish GitHub Release
   # ──────────────────────────────────────────────
   release:
     name: Publish Release
@@ -244,7 +210,6 @@ jobs:
             slipstreamplus-linux-amd64
             slipstreamplus-linux-arm64
             slipstreamplus-windows-amd64.exe
-            slipstreamplus-windows-arm64.exe
             slipstreamplus-darwin-amd64
             slipstreamplus-darwin-arm64
             slipstreamplus-freebsd-amd64
