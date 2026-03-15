@@ -26,7 +26,7 @@ jobs:
             rust_target: aarch64-unknown-linux-gnu
             binary: slipstream-client-linux-arm64
           - name: darwin-amd64
-            os: macos-13
+            os: macos-14
             rust_target: x86_64-apple-darwin
             binary: slipstream-client-darwin-amd64
           - name: darwin-arm64
@@ -49,7 +49,9 @@ jobs:
 
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake openssl
+        run: |
+          brew install cmake openssl bash
+          echo "/opt/homebrew/bin" >> $GITHUB_PATH
 
       - name: Build Rust binary
         working-directory: slipstream-rust
