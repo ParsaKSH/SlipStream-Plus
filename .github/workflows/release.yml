@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   # ──────────────────────────────────────────────
-  # Step 1: Build slipstream-rust core for all platforms
+  # Build slipstream-rust core natively per platform
   # ──────────────────────────────────────────────
   build-rust:
     name: Rust Core (${{ matrix.name }})
@@ -22,39 +22,20 @@ jobs:
         include:
           - name: linux-amd64
             os: ubuntu-latest
-            rust_target: x86_64-unknown-linux-musl
+            rust_target: x86_64-unknown-linux-gnu
             binary: slipstream-client-linux-amd64
-            use_cross: true
           - name: linux-arm64
-            os: ubuntu-latest
-            rust_target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
             binary: slipstream-client-linux-arm64
-            use_cross: true
-          - name: windows-amd64
-            os: ubuntu-latest
-            rust_target: x86_64-pc-windows-gnu
-            binary: slipstream-client.exe
-            use_cross: true
           - name: darwin-amd64
             os: macos-13
             rust_target: x86_64-apple-darwin
             binary: slipstream-client-darwin-amd64
-            use_cross: false
           - name: darwin-arm64
             os: macos-14
             rust_target: aarch64-apple-darwin
             binary: slipstream-client-darwin-arm64
-            use_cross: false
-          - name: freebsd-amd64
-            os: ubuntu-latest
-            rust_target: x86_64-unknown-freebsd
-            binary: slipstream-client-freebsd-amd64
-            use_cross: true
-          - name: openbsd-amd64
-            os: ubuntu-latest
-            rust_target: x86_64-unknown-openbsd
-            binary: slipstream-client-openbsd-amd64
-            use_cross: true
 
     steps:
       - name: Clone slipstream-rust
@@ -67,43 +48,18 @@ jobs:
 
       - name: Install build deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y cmake
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake libssl-dev
 
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake
+        run: brew install cmake openssl
 
-      - name: Install cross
-        if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Configure cross for musl
-        if: matrix.use_cross
+      - name: Build Rust binary
         working-directory: slipstream-rust
-        run: |
-          cat > Cross.toml << 'EOF'
-          [build.env]
-          passthrough = ["CFLAGS", "CXXFLAGS", "CMAKE_C_FLAGS"]
-          EOF
-
-      - name: Build with cross
-        if: matrix.use_cross
-        working-directory: slipstream-rust
-        env:
-          CFLAGS: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
-          CXXFLAGS: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
-          CMAKE_C_FLAGS: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
-        run: cross build --release --target ${{ matrix.rust_target }} -p slipstream-client --features openssl-vendored,picoquic-minimal-build
-
-      - name: Build with cargo (native)
-        if: "!matrix.use_cross"
-        working-directory: slipstream-rust
-        run: cargo build --release --target ${{ matrix.rust_target }} -p slipstream-client --features openssl-vendored,picoquic-minimal-build
+        run: cargo build --release --target ${{ matrix.rust_target }} -p slipstream-client --features picoquic-minimal-build
 
       - name: Prepare artifact
         run: |
-          # Find built binary
-          find slipstream-rust/target/${{ matrix.rust_target }}/release/ -maxdepth 1 -name "slipstream-client*" -type f ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" | head -5
           SRC=$(find slipstream-rust/target/${{ matrix.rust_target }}/release/ -maxdepth 1 \( -name "slipstream-client" -o -name "slipstream-client.exe" \) -type f | head -1)
           cp "$SRC" "${{ matrix.binary }}"
           chmod +x "${{ matrix.binary }}" 2>/dev/null || true
@@ -117,7 +73,7 @@ jobs:
           retention-days: 1
 
   # ──────────────────────────────────────────────
-  # Step 2: Build Go binaries with embedded Rust core
+  # Build Go binaries with embedded Rust core
   # ──────────────────────────────────────────────
   build-go:
     name: Go Build (${{ matrix.name }})
@@ -142,8 +98,8 @@ jobs:
           - name: windows-amd64
             goos: windows
             goarch: amd64
-            rust_artifact: rust-windows-amd64
-            rust_binary: slipstream-client.exe
+            rust_artifact: ""
+            rust_binary: ""
             output: slipstreamplus-windows-amd64.exe
           - name: darwin-amd64
             goos: darwin
@@ -157,18 +113,6 @@ jobs:
             rust_artifact: rust-darwin-arm64
             rust_binary: slipstream-client-darwin-arm64
             output: slipstreamplus-darwin-arm64
-          - name: freebsd-amd64
-            goos: freebsd
-            goarch: amd64
-            rust_artifact: rust-freebsd-amd64
-            rust_binary: slipstream-client-freebsd-amd64
-            output: slipstreamplus-freebsd-amd64
-          - name: openbsd-amd64
-            goos: openbsd
-            goarch: amd64
-            rust_artifact: rust-openbsd-amd64
-            rust_binary: slipstream-client-openbsd-amd64
-            output: slipstreamplus-openbsd-amd64
 
     steps:
       - name: Checkout Code
@@ -181,15 +125,22 @@ jobs:
           check-latest: true
 
       - name: Download Rust binary
+        if: matrix.rust_artifact != ''
         uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.rust_artifact }}
           path: slipstreamorg/
 
-      - name: Verify embedded binary
-        run: ls -la slipstreamorg/
+      - name: Build with embed
+        if: matrix.rust_artifact != ''
+        run: |
+          ls -la slipstreamorg/
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -tags embed_slipstream -ldflags="-s -w" \
+            -o ${{ matrix.output }} ./cmd/slipstreamplus
 
-      - name: Build Go binary
+      - name: Build without embed (Windows)
+        if: matrix.rust_artifact == ''
         run: |
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -tags embed_slipstream -ldflags="-s -w" \
@@ -203,7 +154,7 @@ jobs:
           retention-days: 1
 
   # ──────────────────────────────────────────────
-  # Step 3: Publish GitHub Release
+  # Publish GitHub Release
   # ──────────────────────────────────────────────
   release:
     name: Publish Release
@@ -229,6 +180,4 @@ jobs:
             slipstreamplus-windows-amd64.exe
             slipstreamplus-darwin-amd64
             slipstreamplus-darwin-arm64
-            slipstreamplus-freebsd-amd64
-            slipstreamplus-openbsd-amd64
           generate_release_notes: true
