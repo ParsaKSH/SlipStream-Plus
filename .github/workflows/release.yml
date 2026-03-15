@@ -24,18 +24,22 @@ jobs:
             os: ubuntu-latest
             rust_target: x86_64-unknown-linux-gnu
             binary: slipstream-client-linux-amd64
+            features: picoquic-minimal-build
           - name: linux-arm64
             os: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
             binary: slipstream-client-linux-arm64
+            features: picoquic-minimal-build
           - name: darwin-amd64
             os: macos-14
             rust_target: x86_64-apple-darwin
             binary: slipstream-client-darwin-amd64
+            features: openssl-vendored,picoquic-minimal-build
           - name: darwin-arm64
             os: macos-14
             rust_target: aarch64-apple-darwin
             binary: slipstream-client-darwin-arm64
+            features: openssl-vendored,picoquic-minimal-build
 
     steps:
       - name: Clone slipstream-rust
@@ -58,7 +62,7 @@ jobs:
 
       - name: Build Rust binary
         working-directory: slipstream-rust
-        run: cargo build --release --target ${{ matrix.rust_target }} -p slipstream-client --features picoquic-minimal-build
+        run: cargo build --release --target ${{ matrix.rust_target }} -p slipstream-client --features ${{ matrix.features }}
 
       - name: Prepare artifact
         run: |
