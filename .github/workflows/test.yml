@@ -27,11 +27,11 @@ jobs:
             rust_target: aarch64-unknown-linux-gnu
             binary: slipstream-client-linux-arm64
             features: picoquic-minimal-build
-          - name: darwin-amd64
-            os: macos-14
-            rust_target: x86_64-apple-darwin
-            binary: slipstream-client-darwin-amd64
-            features: openssl-vendored,picoquic-minimal-build
+#          - name: darwin-amd64
+#            os: macos-14
+#            rust_target: x86_64-apple-darwin
+#            binary: slipstream-client-darwin-amd64
+#            features: openssl-vendored,picoquic-minimal-build
           - name: darwin-arm64
             os: macos-14
             rust_target: aarch64-apple-darwin
@@ -106,10 +106,10 @@ jobs:
             goos: windows
             goarch: amd64
             rust_artifact: ""
-          - name: darwin-amd64
-            goos: darwin
-            goarch: amd64
-            rust_artifact: rust-darwin-amd64
+#          - name: darwin-amd64
+#            goos: darwin
+#            goarch: amd64
+#            rust_artifact: rust-darwin-amd64
           - name: darwin-arm64
             goos: darwin
             goarch: arm64
