@@ -30,11 +30,11 @@ jobs:
             rust_target: aarch64-unknown-linux-gnu
             binary: slipstream-client-linux-arm64
             features: picoquic-minimal-build
-#          - name: darwin-amd64
-#            os: macos-14
-#            rust_target: x86_64-apple-darwin
-#            binary: slipstream-client-darwin-amd64
-#            features: openssl-vendored,picoquic-minimal-build
+          - name: darwin-amd64
+            os: macos-14
+            rust_target: x86_64-apple-darwin
+            binary: slipstream-client-darwin-amd64
+            features: openssl-vendored,picoquic-minimal-build
           - name: darwin-arm64
             os: macos-14
             rust_target: aarch64-apple-darwin
@@ -60,14 +60,22 @@ jobs:
           brew install cmake openssl bash
           echo "/opt/homebrew/bin" >> $GITHUB_PATH
 
-      - name: Set cross-arch flags (darwin-amd64)
+      - name: Set cross-arch env (darwin-amd64)
         if: matrix.name == 'darwin-amd64'
         run: |
+          # Create a CC wrapper script that forces -arch x86_64.
+          # Cannot use CC="cc -arch x86_64" because Rust build.rs
+          # passes CC to Command::new() which treats it as a single path.
+          cat > /tmp/cc-x86_64 << 'EOF'
+          #!/bin/bash
+          exec cc -arch x86_64 "$@"
+          EOF
+          chmod +x /tmp/cc-x86_64
+          echo "CC=/tmp/cc-x86_64" >> $GITHUB_ENV
+          echo "CXX=/tmp/cc-x86_64" >> $GITHUB_ENV
           echo "CFLAGS=-arch x86_64" >> $GITHUB_ENV
           echo "CXXFLAGS=-arch x86_64" >> $GITHUB_ENV
           echo "CMAKE_OSX_ARCHITECTURES=x86_64" >> $GITHUB_ENV
-          echo "CC=cc -arch x86_64" >> $GITHUB_ENV
-          echo "AR=ar" >> $GITHUB_ENV
 
       - name: Build Rust binary
         working-directory: slipstream-rust
@@ -116,12 +124,12 @@ jobs:
             rust_artifact: ""
             rust_binary: ""
             output: slipstreamplus-windows-amd64.exe
-#          - name: darwin-amd64
-#            goos: darwin
-#            goarch: amd64
-#            rust_artifact: rust-darwin-amd64
-#            rust_binary: slipstream-client-darwin-amd64
-#            output: slipstreamplus-darwin-amd64
+          - name: darwin-amd64
+            goos: darwin
+            goarch: amd64
+            rust_artifact: rust-darwin-amd64
+            rust_binary: slipstream-client-darwin-amd64
+            output: slipstreamplus-darwin-amd64
           - name: darwin-arm64
             goos: darwin
             goarch: arm64
