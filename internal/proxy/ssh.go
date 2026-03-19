@@ -29,7 +29,6 @@ type SSHServer struct {
 	userMgr        *users.Manager
 	activeConns    atomic.Int64
 	connID         atomic.Uint64
-	bufPool        sync.Pool
 
 	sshMu      sync.RWMutex
 	sshClients map[int]*ssh.Client
@@ -44,12 +43,6 @@ func NewSSHServer(listenAddr string, bufferSize int, maxConns int, mgr *engine.M
 		balancer:       bal,
 		userMgr:        umgr,
 		sshClients:     make(map[int]*ssh.Client),
-		bufPool: sync.Pool{
-			New: func() any {
-				buf := make([]byte, bufferSize)
-				return &buf
-			},
-		},
 	}
 }
 
@@ -311,28 +304,40 @@ func (s *SSHServer) handleConnection(clientConn net.Conn, connID uint64) {
 
 	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-	// Relay with rate limiting
+	// Relay with per-instance buffers, idle timeout, and context cancellation.
+	idleClient := newIdleConn(clientConn, idleTimeout)
+	idleUpstream := newIdleConn(upstreamConn, idleTimeout)
+
+	// If the instance is stopped, close connections to unblock relay goroutines.
+	go func() {
+		select {
+		case <-inst.ConnCtx.Done():
+			clientConn.Close()
+			upstreamConn.Close()
+		}
+	}()
+
 	var txN, rxN int64
 	done := make(chan struct{}, 2)
 	go func() {
-		var src io.Reader = clientConn
+		var src io.Reader = idleClient
 		if user != nil {
 			src = user.WrapReader(src)
 		}
-		bufPtr := s.bufPool.Get().(*[]byte)
-		n, _ := io.CopyBuffer(upstreamConn, src, *bufPtr)
-		s.bufPool.Put(bufPtr)
+		bufPtr := inst.BufPool.Get().(*[]byte)
+		n, _ := io.CopyBuffer(idleUpstream, src, *bufPtr)
+		inst.BufPool.Put(bufPtr)
 		txN = n
 		done <- struct{}{}
 	}()
 	go func() {
-		var dst io.Writer = clientConn
+		var dst io.Writer = idleClient
 		if user != nil {
 			dst = user.WrapWriter(dst)
 		}
-		bufPtr := s.bufPool.Get().(*[]byte)
-		n, _ := io.CopyBuffer(dst, upstreamConn, *bufPtr)
-		s.bufPool.Put(bufPtr)
+		bufPtr := inst.BufPool.Get().(*[]byte)
+		n, _ := io.CopyBuffer(dst, idleUpstream, *bufPtr)
+		inst.BufPool.Put(bufPtr)
 		rxN = n
 		done <- struct{}{}
 	}()

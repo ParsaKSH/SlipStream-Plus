@@ -11,12 +11,13 @@ import (
 )
 
 type Manager struct {
-	instances []*Instance
-	binary    string
-	mu        sync.RWMutex
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	instances  []*Instance
+	binary     string
+	bufferSize int
+	mu         sync.RWMutex
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 func NewManager(cfg *config.Config) (*Manager, error) {
@@ -30,14 +31,20 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 		return nil, fmt.Errorf("expand instances: %w", err)
 	}
 
+	bufSize := cfg.Socks.BufferSize
+	if bufSize <= 0 {
+		bufSize = 65536
+	}
+
 	m := &Manager{
-		binary: binary,
-		ctx:    ctx,
-		cancel: cancel,
+		binary:     binary,
+		bufferSize: bufSize,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 
 	for i, ei := range expanded {
-		inst := NewInstance(i, ei, binary)
+		inst := NewInstance(i, ei, binary, bufSize)
 		m.instances = append(m.instances, inst)
 	}
 
@@ -228,7 +235,7 @@ func (m *Manager) Reload(cfg *config.Config) error {
 
 	m.instances = make([]*Instance, len(expanded))
 	for i, ei := range expanded {
-		m.instances[i] = NewInstance(i, ei, binary)
+		m.instances[i] = NewInstance(i, ei, binary, m.bufferSize)
 	}
 	m.mu.Unlock()
 

@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,6 +14,9 @@ import (
 	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 	"github.com/ParsaKSH/SlipStream-Plus/internal/users"
 )
+
+// idleTimeout is how long a relay connection can be idle before being closed.
+const idleTimeout = 5 * time.Minute
 
 // Server is a SOCKS5 proxy with optional user auth, load balancing across instances.
 type Server struct {
@@ -25,7 +27,6 @@ type Server struct {
 	balancer       balancer.Balancer
 	userMgr        *users.Manager
 	activeConns    atomic.Int64
-	bufPool        sync.Pool
 	connID         atomic.Uint64
 }
 
@@ -37,12 +38,6 @@ func NewServer(listenAddr string, bufferSize int, maxConns int, mgr *engine.Mana
 		manager:        mgr,
 		balancer:       bal,
 		userMgr:        umgr,
-		bufPool: sync.Pool{
-			New: func() any {
-				buf := make([]byte, bufferSize)
-				return &buf
-			},
-		},
 	}
 }
 
@@ -293,22 +288,35 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 	port := binary.BigEndian.Uint16(portBytes)
 	log.Printf("[proxy] conn#%d: connected via instance %d, port %d", connID, inst.ID(), port)
 
-	s.relay(clientConn, upstreamConn, inst, user, connID)
+	s.relay(inst.ConnCtx, clientConn, upstreamConn, inst, user, connID)
 }
 
-func (s *Server) relay(clientConn, upstreamConn net.Conn, inst *engine.Instance, user *users.User, connID uint64) {
+func (s *Server) relay(ctx context.Context, clientConn, upstreamConn net.Conn, inst *engine.Instance, user *users.User, connID uint64) {
+	// Wrap both connections with idle timeout so stuck connections are cleaned up.
+	idleClient := newIdleConn(clientConn, idleTimeout)
+	idleUpstream := newIdleConn(upstreamConn, idleTimeout)
+
+	// If the instance is stopped (context cancelled), close both connections
+	// so the relay goroutines unblock and exit.
+	go func() {
+		select {
+		case <-ctx.Done():
+			clientConn.Close()
+			upstreamConn.Close()
+		}
+	}()
+
 	var clientToUpstream, upstreamToClient int64
 	done := make(chan struct{}, 2)
 
 	go func() {
-		var dst io.Writer = upstreamConn
-		var src io.Reader = clientConn
+		var src io.Reader = idleClient
 		if user != nil {
 			src = user.WrapReader(src)
 		}
-		bufPtr := s.bufPool.Get().(*[]byte)
-		n, _ := io.CopyBuffer(dst, src, *bufPtr)
-		s.bufPool.Put(bufPtr)
+		bufPtr := inst.BufPool.Get().(*[]byte)
+		n, _ := io.CopyBuffer(idleUpstream, src, *bufPtr)
+		inst.BufPool.Put(bufPtr)
 		clientToUpstream = n
 		if tc, ok := upstreamConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
@@ -317,14 +325,13 @@ func (s *Server) relay(clientConn, upstreamConn net.Conn, inst *engine.Instance,
 	}()
 
 	go func() {
-		var dst io.Writer = clientConn
-		var src io.Reader = upstreamConn
+		var dst io.Writer = idleClient
 		if user != nil {
 			dst = user.WrapWriter(dst)
 		}
-		bufPtr := s.bufPool.Get().(*[]byte)
-		n, _ := io.CopyBuffer(dst, src, *bufPtr)
-		s.bufPool.Put(bufPtr)
+		bufPtr := inst.BufPool.Get().(*[]byte)
+		n, _ := io.CopyBuffer(dst, idleUpstream, *bufPtr)
+		inst.BufPool.Put(bufPtr)
 		upstreamToClient = n
 		if tc, ok := clientConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
