@@ -10,9 +10,125 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build & Release
+  # ──────────────────────────────────────────────
+  # Build slipstream-rust core natively per platform
+  # ──────────────────────────────────────────────
+  build-rust:
+    name: Rust Core (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            binary: slipstream-client-linux-amd64
+            features: picoquic-minimal-build
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            binary: slipstream-client-linux-arm64
+            features: picoquic-minimal-build
+#          - name: darwin-amd64
+#            os: macos-14
+#            rust_target: x86_64-apple-darwin
+#            binary: slipstream-client-darwin-amd64
+#            features: openssl-vendored,picoquic-minimal-build
+          - name: darwin-arm64
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            binary: slipstream-client-darwin-arm64
+            features: openssl-vendored,picoquic-minimal-build
+
+    steps:
+      - name: Clone slipstream-rust
+        run: git clone --depth 1 --recurse-submodules https://github.com/Mygod/slipstream-rust.git
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake libssl-dev
+
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake openssl bash
+          echo "/opt/homebrew/bin" >> $GITHUB_PATH
+
+      - name: Set cross-arch flags (darwin-amd64)
+        if: matrix.name == 'darwin-amd64'
+        run: |
+          echo "CFLAGS=-arch x86_64" >> $GITHUB_ENV
+          echo "CXXFLAGS=-arch x86_64" >> $GITHUB_ENV
+          echo "CMAKE_OSX_ARCHITECTURES=x86_64" >> $GITHUB_ENV
+          echo "CC=cc -arch x86_64" >> $GITHUB_ENV
+          echo "AR=ar" >> $GITHUB_ENV
+
+      - name: Build Rust binary
+        working-directory: slipstream-rust
+        run: cargo build --release --target ${{ matrix.rust_target }} -p slipstream-client --features ${{ matrix.features }}
+
+      - name: Prepare artifact
+        run: |
+          SRC=$(find slipstream-rust/target/${{ matrix.rust_target }}/release/ -maxdepth 1 \( -name "slipstream-client" -o -name "slipstream-client.exe" \) -type f | head -1)
+          cp "$SRC" "${{ matrix.binary }}"
+          chmod +x "${{ matrix.binary }}" 2>/dev/null || true
+          ls -la "${{ matrix.binary }}"
+
+      - name: Upload Rust binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-${{ matrix.name }}
+          path: ${{ matrix.binary }}
+          retention-days: 1
+
+  # ──────────────────────────────────────────────
+  # Build Go binaries with embedded Rust core
+  # ──────────────────────────────────────────────
+  build-go:
+    name: Go Build (${{ matrix.name }})
     runs-on: ubuntu-latest
+    needs: build-rust
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            goos: linux
+            goarch: amd64
+            rust_artifact: rust-linux-amd64
+            rust_binary: slipstream-client-linux-amd64
+            output: slipstreamplus-linux-amd64
+          - name: linux-arm64
+            goos: linux
+            goarch: arm64
+            rust_artifact: rust-linux-arm64
+            rust_binary: slipstream-client-linux-arm64
+            output: slipstreamplus-linux-arm64
+          - name: windows-amd64
+            goos: windows
+            goarch: amd64
+            rust_artifact: ""
+            rust_binary: ""
+            output: slipstreamplus-windows-amd64.exe
+#          - name: darwin-amd64
+#            goos: darwin
+#            goarch: amd64
+#            rust_artifact: rust-darwin-amd64
+#            rust_binary: slipstream-client-darwin-amd64
+#            output: slipstreamplus-darwin-amd64
+          - name: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            rust_artifact: rust-darwin-arm64
+            rust_binary: slipstream-client-darwin-arm64
+            output: slipstreamplus-darwin-arm64
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -23,19 +139,60 @@ jobs:
           go-version: '1.22'
           check-latest: true
 
-      - name: Build Linux (amd64)
-        run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embed_slipstream -ldflags="-s -w" -o slipstreamplus-linux-amd64 ./cmd/slipstreamplus
+      - name: Download Rust binary
+        if: matrix.rust_artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.rust_artifact }}
+          path: slipstreamorg/
 
-      - name: Build Windows (amd64)
+      - name: Build with embed
+        if: matrix.rust_artifact != ''
         run: |
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -ldflags="-s -w" -o slipstreamplus-windows-amd64.exe ./cmd/slipstreamplus
+          ls -la slipstreamorg/
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -tags embed_slipstream -ldflags="-s -w" \
+            -o ${{ matrix.output }} ./cmd/slipstreamplus
+
+      - name: Build without embed (Windows)
+        if: matrix.rust_artifact == ''
+        run: |
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -tags embed_slipstream -ldflags="-s -w" \
+            -o ${{ matrix.output }} ./cmd/slipstreamplus
+
+      - name: Upload Go binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-${{ matrix.name }}
+          path: ${{ matrix.output }}
+          retention-days: 1
+
+  # ──────────────────────────────────────────────
+  # Publish GitHub Release
+  # ──────────────────────────────────────────────
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: build-go
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all Go binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: go-*
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -la
 
       - name: Publish Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
             slipstreamplus-linux-amd64
+            slipstreamplus-linux-arm64
             slipstreamplus-windows-amd64.exe
+            slipstreamplus-darwin-amd64
+            slipstreamplus-darwin-arm64
           generate_release_notes: true

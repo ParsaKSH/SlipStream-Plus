@@ -29,7 +29,6 @@ type SSHServer struct {
 	userMgr        *users.Manager
 	activeConns    atomic.Int64
 	connID         atomic.Uint64
-	bufPool        sync.Pool
 
 	sshMu      sync.RWMutex
 	sshClients map[int]*ssh.Client
@@ -44,12 +43,6 @@ func NewSSHServer(listenAddr string, bufferSize int, maxConns int, mgr *engine.M
 		balancer:       bal,
 		userMgr:        umgr,
 		sshClients:     make(map[int]*ssh.Client),
-		bufPool: sync.Pool{
-			New: func() any {
-				buf := make([]byte, bufferSize)
-				return &buf
-			},
-		},
 	}
 }
 
@@ -313,35 +306,47 @@ func (s *SSHServer) handleConnection(clientConn net.Conn, connID uint64) {
 
 	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-	// Relay with rate limiting or zero-copy
+	// Relay with per-instance buffers, idle timeout, and context cancellation.
+	idleClient := newIdleConn(clientConn, idleTimeout)
+	idleUpstream := newIdleConn(upstreamConn, idleTimeout)
+
+	// If the instance is stopped, close connections to unblock relay goroutines.
+	go func() {
+		select {
+		case <-inst.ConnCtx.Done():
+			clientConn.Close()
+			upstreamConn.Close()
+		}
+	}()
+
 	needsWrap := user != nil && user.NeedsRateLimit()
 
 	var txN, rxN int64
 	done := make(chan struct{}, 2)
 	go func() {
 		if needsWrap {
-			src := user.WrapReader(clientConn)
-			bufPtr := s.bufPool.Get().(*[]byte)
-			n, _ := io.CopyBuffer(upstreamConn, src, *bufPtr)
-			s.bufPool.Put(bufPtr)
+			src := user.WrapReader(idleClient)
+			bufPtr := inst.BufPool.Get().(*[]byte)
+			n, _ := io.CopyBuffer(idleUpstream, src, *bufPtr)
+			inst.BufPool.Put(bufPtr)
 			txN = n
 		} else {
-			// Zero-copy path (splice on Linux)
-			n, _ := io.Copy(upstreamConn, clientConn)
+			// Zero-copy path with idle timeout
+			n, _ := io.Copy(idleUpstream, idleClient)
 			txN = n
 		}
 		done <- struct{}{}
 	}()
 	go func() {
 		if needsWrap {
-			dst := user.WrapWriter(clientConn)
-			bufPtr := s.bufPool.Get().(*[]byte)
-			n, _ := io.CopyBuffer(dst, upstreamConn, *bufPtr)
-			s.bufPool.Put(bufPtr)
+			dst := user.WrapWriter(idleClient)
+			bufPtr := inst.BufPool.Get().(*[]byte)
+			n, _ := io.CopyBuffer(dst, idleUpstream, *bufPtr)
+			inst.BufPool.Put(bufPtr)
 			rxN = n
 		} else {
-			// Zero-copy path
-			n, _ := io.Copy(clientConn, upstreamConn)
+			// Zero-copy path with idle timeout
+			n, _ := io.Copy(idleClient, idleUpstream)
 			rxN = n
 		}
 		done <- struct{}{}
