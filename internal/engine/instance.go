@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -41,6 +42,13 @@ type Instance struct {
 	Config config.ExpandedInstance
 	Binary string
 
+	// Per-instance buffer pool — isolated per instance, fresh on restart.
+	BufPool sync.Pool
+
+	// ConnCtx is cancelled when the instance is stopped, killing all in-flight relays.
+	ConnCtx    context.Context
+	connCancel context.CancelFunc
+
 	mu          sync.RWMutex
 	state       InstanceState
 	cmd         *exec.Cmd
@@ -50,16 +58,28 @@ type Instance struct {
 	rxBytes     atomic.Int64 // total bytes downloaded (upstream → client)
 	stopCh      chan struct{}
 	id          int
+	bufferSize  int
 }
 
-func NewInstance(id int, cfg config.ExpandedInstance, binary string) *Instance {
-	return &Instance{
-		Config: cfg,
-		Binary: binary,
-		id:     id,
-		state:  StateDead,
-		stopCh: make(chan struct{}),
+func NewInstance(id int, cfg config.ExpandedInstance, binary string, bufferSize int) *Instance {
+	ctx, cancel := context.WithCancel(context.Background())
+	inst := &Instance{
+		Config:     cfg,
+		Binary:     binary,
+		id:         id,
+		state:      StateDead,
+		stopCh:     make(chan struct{}),
+		bufferSize: bufferSize,
+		ConnCtx:    ctx,
+		connCancel: cancel,
 	}
+	inst.BufPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, inst.bufferSize)
+			return &buf
+		},
+	}
+	return inst
 }
 
 func (inst *Instance) ID() int                { return inst.id }
@@ -102,6 +122,17 @@ func (inst *Instance) Dial() (net.Conn, error) {
 func (inst *Instance) Start() error {
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
+
+	// Fresh context + buffer pool for this lifecycle.
+	ctx, cancel := context.WithCancel(context.Background())
+	inst.ConnCtx = ctx
+	inst.connCancel = cancel
+	inst.BufPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, inst.bufferSize)
+			return &buf
+		},
+	}
 
 	args := []string{
 		"--tcp-listen-port", fmt.Sprintf("%d", inst.Config.Port),
@@ -161,6 +192,11 @@ func (inst *Instance) Start() error {
 func (inst *Instance) Stop() error {
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
+
+	// Cancel all in-flight relay goroutines for this instance.
+	if inst.connCancel != nil {
+		inst.connCancel()
+	}
 
 	select {
 	case <-inst.stopCh:
