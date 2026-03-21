@@ -30,12 +30,13 @@ func (w *WeightedRoundRobin) Pick(instances []*engine.Instance) *engine.Instance
 	weights := computeWeights(instances)
 
 	for attempts := 0; attempts < len(instances)*2; attempts++ {
-		if w.counter >= weights[w.current] {
-			w.counter = 0
-			w.current = (w.current + 1) % len(instances)
+		idx := w.current % len(instances)
+		if w.counter < weights[idx] {
+			w.counter++
+			return instances[idx]
 		}
-		w.counter++
-		return instances[w.current]
+		w.counter = 0
+		w.current++
 	}
 	return instances[0]
 }

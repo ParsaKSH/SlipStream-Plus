@@ -161,6 +161,9 @@ jobs:
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -tags embed_slipstream -ldflags="-s -w" \
             -o ${{ matrix.output }} ./cmd/slipstreamplus
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -ldflags="-s -w" \
+            -o centralserver-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }} ./cmd/centralserver
 
       - name: Build without embed (Windows)
         if: matrix.rust_artifact == ''
@@ -168,12 +171,17 @@ jobs:
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -tags embed_slipstream -ldflags="-s -w" \
             -o ${{ matrix.output }} ./cmd/slipstreamplus
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -ldflags="-s -w" \
+            -o centralserver-${{ matrix.goos }}-${{ matrix.goarch }}.exe ./cmd/centralserver
 
       - name: Upload Go binary
         uses: actions/upload-artifact@v4
         with:
           name: go-${{ matrix.name }}
-          path: ${{ matrix.output }}
+          path: |
+            ${{ matrix.output }}
+            centralserver-*
           retention-days: 1
 
   # ──────────────────────────────────────────────
@@ -203,4 +211,9 @@ jobs:
             slipstreamplus-windows-amd64.exe
             slipstreamplus-darwin-amd64
             slipstreamplus-darwin-arm64
+            centralserver-linux-amd64
+            centralserver-linux-arm64
+            centralserver-windows-amd64.exe
+            centralserver-darwin-amd64
+            centralserver-darwin-arm64
           generate_release_notes: true
