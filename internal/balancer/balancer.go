@@ -20,6 +20,8 @@ func New(strategy string) Balancer {
 		return NewLeastPing()
 	case "least_load":
 		return NewLeastLoad()
+	case "weighted_rr", "packet_split":
+		return NewWeightedRoundRobin()
 	default:
 		return NewRoundRobin()
 	}

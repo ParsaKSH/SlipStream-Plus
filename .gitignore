@@ -9,3 +9,4 @@ SlipStreamPlus.tar.gz
 # Rust core binaries (built by CI from source)
 slipstreamorg/slipstream-client-*
 slipstreamorg/slipstream-client.exe
+slipstreamplus-v1.0.4-linux-amd64

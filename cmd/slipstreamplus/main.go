@@ -14,6 +14,7 @@ import (
 	"github.com/ParsaKSH/SlipStream-Plus/internal/gui"
 	"github.com/ParsaKSH/SlipStream-Plus/internal/health"
 	"github.com/ParsaKSH/SlipStream-Plus/internal/proxy"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/tunnel"
 	"github.com/ParsaKSH/SlipStream-Plus/internal/users"
 )
 
@@ -89,6 +90,16 @@ func main() {
 		userMgr = users.NewManager(cfg.Socks.Users)
 	}
 
+	// TunnelPool for packet-split mode
+	var tunnelPool *tunnel.TunnelPool
+	isPacketSplit := cfg.Strategy == "packet_split"
+	if isPacketSplit {
+		tunnelPool = tunnel.NewTunnelPool(mgr)
+		tunnelPool.Start()
+		log.Printf("Packet-split mode: central_server=%s, chunk_size=%d",
+			cfg.CentralServer.Address, cfg.CentralServer.ChunkSize)
+	}
+
 	// GUI
 	if *enableGUI || cfg.GUI.Enabled {
 		if *guiPort != "" {
@@ -108,6 +119,9 @@ func main() {
 		sig := <-sigCh
 		log.Printf("Received signal %v, shutting down...", sig)
 		checker.Stop()
+		if tunnelPool != nil {
+			tunnelPool.Stop()
+		}
 		mgr.Shutdown()
 		os.Exit(0)
 	}()
@@ -124,11 +138,18 @@ func main() {
 			log.Fatalf("SSH proxy error: %v", err)
 		}
 	} else if !hasSSH && hasSOCKS {
-		log.Printf("Starting in SOCKS mode (SOCKS5 → slipstream)")
+		if isPacketSplit {
+			log.Printf("Starting in PACKET-SPLIT mode (SOCKS5 → packet split → instances → central server)")
+		} else {
+			log.Printf("Starting in SOCKS mode (SOCKS5 → slipstream)")
+		}
 		proxyServer := proxy.NewServer(
 			cfg.Socks.Listen, cfg.Socks.BufferSize, cfg.Socks.MaxConnections,
 			mgr, bal, userMgr,
 		)
+		if isPacketSplit {
+			proxyServer.EnablePacketSplit(tunnelPool, cfg.CentralServer.ChunkSize)
+		}
 		if err := proxyServer.ListenAndServe(); err != nil {
 			log.Fatalf("Proxy error: %v", err)
 		}
