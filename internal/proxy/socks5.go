@@ -7,11 +7,13 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ParsaKSH/SlipStream-Plus/internal/balancer"
 	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/tunnel"
 	"github.com/ParsaKSH/SlipStream-Plus/internal/users"
 )
 
@@ -28,6 +30,12 @@ type Server struct {
 	userMgr        *users.Manager
 	activeConns    atomic.Int64
 	connID         atomic.Uint64
+
+	// Packet-split mode fields
+	packetSplit bool
+	tunnelPool  *tunnel.TunnelPool
+	connIDGen   tunnel.ConnIDGenerator
+	chunkSize   int
 }
 
 func NewServer(listenAddr string, bufferSize int, maxConns int, mgr *engine.Manager, bal balancer.Balancer, umgr *users.Manager) *Server {
@@ -39,6 +47,14 @@ func NewServer(listenAddr string, bufferSize int, maxConns int, mgr *engine.Mana
 		balancer:       bal,
 		userMgr:        umgr,
 	}
+}
+
+// EnablePacketSplit activates packet-level load balancing mode.
+func (s *Server) EnablePacketSplit(pool *tunnel.TunnelPool, chunkSize int) {
+	s.packetSplit = true
+	s.tunnelPool = pool
+	s.chunkSize = chunkSize
+	log.Printf("[proxy] packet-split mode enabled (chunk_size=%d)", chunkSize)
 }
 
 func (s *Server) ListenAndServe() error {
@@ -53,8 +69,12 @@ func (s *Server) ListenAndServe() error {
 	if s.userMgr != nil && s.userMgr.HasUsers() {
 		authMode = "username/password"
 	}
-	log.Printf("[proxy] SOCKS5 proxy listening on %s (auth=%s, buffer=%d, max_conns=%d)",
-		s.listenAddr, authMode, s.bufferSize, s.maxConnections)
+	mode := "connection"
+	if s.packetSplit {
+		mode = "packet-split"
+	}
+	log.Printf("[proxy] SOCKS5 proxy listening on %s (auth=%s, mode=%s, buffer=%d, max_conns=%d)",
+		s.listenAddr, authMode, mode, s.bufferSize, s.maxConnections)
 
 	for {
 		conn, err := ln.Accept()
@@ -206,7 +226,89 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 		return
 	}
 
-	// ──── Pick upstream slipstream instance ────
+	// ──── Route based on mode ────
+	if s.packetSplit {
+		s.handlePacketSplit(clientConn, connID, atyp, addrBytes, portBytes, user)
+	} else {
+		s.handleConnectionLevel(clientConn, connID, atyp, addrBytes, portBytes, user)
+	}
+}
+
+// handlePacketSplit handles a connection using packet-level load balancing.
+func (s *Server) handlePacketSplit(clientConn net.Conn, connID uint64, atyp byte, addrBytes, portBytes []byte, user *users.User) {
+	healthy := s.manager.HealthyInstances()
+	socksHealthy := make([]*engine.Instance, 0, len(healthy))
+	for _, inst := range healthy {
+		if inst.Config.Mode != "ssh" {
+			socksHealthy = append(socksHealthy, inst)
+		}
+	}
+	if len(socksHealthy) == 0 {
+		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	// Create a packet splitter for this connection
+	tunnelConnID := s.connIDGen.Next()
+	splitter := tunnel.NewPacketSplitter(tunnelConnID, s.tunnelPool, socksHealthy, s.chunkSize)
+	defer splitter.Close()
+
+	// Send SYN with target address info
+	if err := splitter.SendSYN(atyp, addrBytes, portBytes); err != nil {
+		log.Printf("[proxy] conn#%d: SYN failed: %v", connID, err)
+		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	// Tell client: connection successful
+	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+
+	port := binary.BigEndian.Uint16(portBytes)
+	log.Printf("[proxy] conn#%d: packet-split mode, %d instances, port %d",
+		connID, len(socksHealthy), port)
+
+	// Create a context that cancels when any instance in the pool dies
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Bidirectional relay using packet splitter
+	var txN, rxN int64
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if user != nil && user.NeedsRateLimit() {
+			wrapped := user.WrapReader(clientConn)
+			txN = splitter.RelayClientToUpstream(ctx, wrapped)
+		} else {
+			txN = splitter.RelayClientToUpstream(ctx, clientConn)
+		}
+		cancel()
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if user != nil && user.NeedsRateLimit() {
+			wrapped := user.WrapWriter(clientConn)
+			rxN = splitter.RelayUpstreamToClient(ctx, wrapped)
+		} else {
+			rxN = splitter.RelayUpstreamToClient(ctx, clientConn)
+		}
+		cancel()
+	}()
+
+	wg.Wait()
+
+	// Track bytes for user data quota
+	if user != nil {
+		user.AddUsedBytes(txN + rxN)
+	}
+}
+
+// handleConnectionLevel handles a connection using traditional per-connection load balancing.
+func (s *Server) handleConnectionLevel(clientConn net.Conn, connID uint64, atyp byte, addrBytes, portBytes []byte, user *users.User) {
 	healthy := s.manager.HealthyInstances()
 	socksHealthy := make([]*engine.Instance, 0, len(healthy))
 	for _, inst := range healthy {
@@ -242,9 +344,6 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 	}
 
 	// ──── Pipelined SOCKS5 negotiation with upstream ────
-	// Combine greeting + CONNECT into ONE write to minimize DNS tunnel round-trips.
-	// Greeting: VER=5, NMETHODS=1, METHOD=0x00 (no auth)
-	// CONNECT:  VER=5, CMD=1, RSV=0, ATYP, ADDR, PORT
 	pipelined := make([]byte, 0, 3+4+len(addrBytes)+2)
 	pipelined = append(pipelined, 0x05, 0x01, 0x00)       // greeting
 	pipelined = append(pipelined, 0x05, 0x01, 0x00, atyp) // CONNECT header
@@ -261,7 +360,6 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
-	// resp[0..1] = greeting reply, resp[2..5] = CONNECT reply header
 
 	// Drain the CONNECT reply's bind address + port
 	repAtyp := resp[5]
@@ -311,8 +409,6 @@ func (s *Server) relay(ctx context.Context, clientConn, upstreamConn net.Conn, i
 	}()
 
 	// Determine if we need rate-limited (wrapped) relay or can use zero-copy.
-	// When user is nil or has no bandwidth limiter, io.Copy between raw
-	// net.TCPConns triggers Linux splice(2) — zero-copy kernel-to-kernel transfer.
 	needsWrap := user != nil && user.NeedsRateLimit()
 
 	var clientToUpstream, upstreamToClient int64

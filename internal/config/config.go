@@ -10,12 +10,20 @@ import (
 )
 
 type Config struct {
-	Socks            SocksConfig       `json:"socks"`
-	SlipstreamBinary string            `json:"slipstream_binary,omitempty"`
-	Strategy         string            `json:"strategy"`
-	HealthCheck      HealthCheckConfig `json:"health_check"`
-	Instances        []InstanceConfig  `json:"instances"`
-	GUI              GUIConfig         `json:"gui,omitempty"`
+	Socks            SocksConfig         `json:"socks"`
+	SlipstreamBinary string              `json:"slipstream_binary,omitempty"`
+	Strategy         string              `json:"strategy"`
+	HealthCheck      HealthCheckConfig   `json:"health_check"`
+	Instances        []InstanceConfig    `json:"instances"`
+	GUI              GUIConfig           `json:"gui,omitempty"`
+	CentralServer    CentralServerConfig `json:"central_server,omitempty"`
+}
+
+// CentralServerConfig defines the remote reassembly server for packet-level load balancing.
+type CentralServerConfig struct {
+	Address   string `json:"address"`    // e.g. "1.2.3.4:9500"
+	Secret    string `json:"secret"`     // shared secret for authentication
+	ChunkSize int    `json:"chunk_size"` // max payload per frame (default: 8192)
 }
 
 type SocksConfig struct {
@@ -251,11 +259,21 @@ func (c *Config) Validate() error {
 	}
 
 	switch c.Strategy {
-	case "round_robin", "random", "least_ping", "least_load":
+	case "round_robin", "random", "least_ping", "least_load", "packet_split":
 	case "":
 		c.Strategy = "round_robin"
 	default:
-		return fmt.Errorf("invalid strategy: %s (valid: round_robin, random, least_ping, least_load)", c.Strategy)
+		return fmt.Errorf("invalid strategy: %s (valid: round_robin, random, least_ping, least_load, packet_split)", c.Strategy)
+	}
+
+	// Validate packet_split requirements
+	if c.Strategy == "packet_split" {
+		if c.CentralServer.Address == "" {
+			return fmt.Errorf("central_server.address is required when strategy=packet_split")
+		}
+		if c.CentralServer.ChunkSize <= 0 {
+			c.CentralServer.ChunkSize = 8192
+		}
 	}
 
 	if c.Socks.BufferSize <= 0 {

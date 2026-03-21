@@ -137,7 +137,9 @@ jobs:
         run: test -z "$(gofmt -l ./...)"
 
       - name: Build without embed
-        run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -v ./cmd/slipstreamplus
+        run: |
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -v ./cmd/slipstreamplus
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -v ./cmd/centralserver
 
       - name: Download Rust binary
         if: matrix.rust_artifact != ''
@@ -158,3 +160,9 @@ jobs:
         run: |
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -tags embed_slipstream -v ./cmd/slipstreamplus
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -v ./cmd/centralserver
+
+      - name: Run unit tests
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: go test -v -race ./internal/tunnel/... ./internal/balancer/...
