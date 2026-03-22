@@ -271,10 +271,19 @@ type Reorderer struct {
 	timeout time.Duration
 }
 
-// NewReorderer creates a new frame reorderer.
+// NewReorderer creates a new frame reorderer starting from sequence 0.
 func NewReorderer() *Reorderer {
 	return &Reorderer{
 		nextSeq: 0,
+		buffer:  make(map[uint32][]byte),
+		timeout: 10 * time.Second,
+	}
+}
+
+// NewReordererAt creates a reorderer starting from a specific sequence number.
+func NewReordererAt(startSeq uint32) *Reorderer {
+	return &Reorderer{
+		nextSeq: startSeq,
 		buffer:  make(map[uint32][]byte),
 		timeout: 10 * time.Second,
 	}
