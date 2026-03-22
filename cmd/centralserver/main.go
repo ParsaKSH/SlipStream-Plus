@@ -22,10 +22,14 @@ type connState struct {
 	mu        sync.Mutex
 	target    net.Conn // connection to the SOCKS upstream
 	reorderer *tunnel.Reorderer
-	txSeq     uint32             // next sequence number for reverse data
-	sources   map[io.Writer]bool // all tunnel connections that can send back
+	txSeq     uint32 // next sequence number for reverse data
 	cancel    context.CancelFunc
 	created   time.Time
+
+	// Sources: all tunnel connections that can carry reverse data.
+	// We round-robin responses across them (not broadcast).
+	sources   []io.Writer
+	sourceIdx int
 }
 
 // centralServer manages all active connections.
@@ -51,7 +55,6 @@ func main() {
 		conns:         make(map[uint32]*connState),
 	}
 
-	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -61,7 +64,6 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Cleanup stale connections periodically
 	go cs.cleanupLoop()
 
 	ln, err := net.Listen("tcp", *listenAddr)
@@ -77,62 +79,49 @@ func main() {
 			log.Printf("[central] accept error: %v", err)
 			continue
 		}
-
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.SetKeepAlive(true)
 			tc.SetKeepAlivePeriod(30 * time.Second)
 			tc.SetNoDelay(true)
 		}
-
 		go cs.handleIncoming(conn)
 	}
 }
 
 // handleIncoming detects the protocol from the first byte:
-//   - 0x05 → SOCKS5 (health probe or legacy) → proxy to socks-upstream
-//   - anything else → our framing protocol → read frames
+//
+//	0x05 → SOCKS5 health probe → passthrough to socks-upstream
+//	else → framing protocol → read frames
 func (cs *centralServer) handleIncoming(conn net.Conn) {
 	defer conn.Close()
 	remoteAddr := conn.RemoteAddr().String()
 
-	// Peek at the first byte to detect protocol
 	firstByte := make([]byte, 1)
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	if _, err := io.ReadFull(conn, firstByte); err != nil {
 		return
 	}
-	conn.SetReadDeadline(time.Time{}) // clear deadline
+	conn.SetReadDeadline(time.Time{})
 
 	if firstByte[0] == 0x05 {
-		// SOCKS5 handshake detected — proxy this through to socks-upstream
-		// This handles health checker probes transparently
 		cs.handleSOCKS5Passthrough(conn, firstByte[0], remoteAddr)
 	} else {
-		// Frame protocol — prepend the first byte back and process frames
 		cs.handleFrameConn(conn, firstByte[0], remoteAddr)
 	}
 }
 
-// handleSOCKS5Passthrough transparently proxies a SOCKS5 connection to socks-upstream.
-// This allows health checker probes to work even though target-address now points to us.
+// handleSOCKS5Passthrough transparently proxies a SOCKS5 connection.
 func (cs *centralServer) handleSOCKS5Passthrough(clientConn net.Conn, firstByte byte, remoteAddr string) {
 	upstream, err := net.DialTimeout("tcp", cs.socksUpstream, 10*time.Second)
 	if err != nil {
-		log.Printf("[central] %s: socks passthrough dial failed: %v", remoteAddr, err)
 		return
 	}
 	defer upstream.Close()
-
 	if tc, ok := upstream.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
+	upstream.Write([]byte{firstByte})
 
-	// Send the first byte we already read to the upstream
-	if _, err := upstream.Write([]byte{firstByte}); err != nil {
-		return
-	}
-
-	// Bidirectional relay
 	done := make(chan struct{}, 2)
 	go func() {
 		io.Copy(upstream, clientConn)
@@ -155,26 +144,22 @@ func (cs *centralServer) handleSOCKS5Passthrough(clientConn net.Conn, firstByte 
 func (cs *centralServer) handleFrameConn(conn net.Conn, firstByte byte, remoteAddr string) {
 	log.Printf("[central] frame connection from %s", remoteAddr)
 
-	// We already read the first byte, so we need to construct the first frame
-	// header manually by reading the remaining 10 bytes
+	// Read remaining header bytes (we already read 1)
 	var hdrRest [tunnel.HeaderSize - 1]byte
 	if _, err := io.ReadFull(conn, hdrRest[:]); err != nil {
 		log.Printf("[central] %s: frame header read error: %v", remoteAddr, err)
 		return
 	}
 
-	// Reconstruct full header
 	var fullHdr [tunnel.HeaderSize]byte
 	fullHdr[0] = firstByte
 	copy(fullHdr[1:], hdrRest[:])
 
-	// Parse first frame manually
 	firstFrame := cs.parseHeader(fullHdr, conn, remoteAddr)
 	if firstFrame != nil {
 		cs.dispatchFrame(firstFrame, conn)
 	}
 
-	// Continue reading frames normally
 	for {
 		frame, err := tunnel.ReadFrame(conn)
 		if err != nil {
@@ -187,23 +172,19 @@ func (cs *centralServer) handleFrameConn(conn net.Conn, firstByte byte, remoteAd
 	}
 }
 
-// parseHeader builds a Frame from a raw header + reads payload.
 func (cs *centralServer) parseHeader(hdr [tunnel.HeaderSize]byte, conn net.Conn, remoteAddr string) *tunnel.Frame {
 	length := binary.BigEndian.Uint16(hdr[9:11])
 	if length > tunnel.MaxPayloadSize {
 		log.Printf("[central] %s: frame payload too large: %d", remoteAddr, length)
 		return nil
 	}
-
 	var payload []byte
 	if length > 0 {
 		payload = make([]byte, length)
 		if _, err := io.ReadFull(conn, payload); err != nil {
-			log.Printf("[central] %s: payload read error: %v", remoteAddr, err)
 			return nil
 		}
 	}
-
 	return &tunnel.Frame{
 		ConnID:  binary.BigEndian.Uint32(hdr[0:4]),
 		SeqNum:  binary.BigEndian.Uint32(hdr[4:8]),
@@ -212,7 +193,6 @@ func (cs *centralServer) parseHeader(hdr [tunnel.HeaderSize]byte, conn net.Conn,
 	}
 }
 
-// dispatchFrame routes a frame to the appropriate connection handler.
 func (cs *centralServer) dispatchFrame(frame *tunnel.Frame, source net.Conn) {
 	if frame.IsSYN() {
 		cs.handleSYN(frame, source)
@@ -226,26 +206,22 @@ func (cs *centralServer) dispatchFrame(frame *tunnel.Frame, source net.Conn) {
 		cs.handleRST(frame)
 		return
 	}
-	// Regular data frame
 	cs.handleData(frame)
 }
 
-// handleSYN initiates a new upstream connection for this ConnID.
 func (cs *centralServer) handleSYN(frame *tunnel.Frame, source net.Conn) {
 	connID := frame.ConnID
 
 	cs.mu.Lock()
-	if _, exists := cs.conns[connID]; exists {
-		// SYN for already-known ConnID — another instance's SYN arrived.
-		state := cs.conns[connID]
-		state.mu.Lock()
-		state.sources[source] = true
-		state.mu.Unlock()
+	if existing, ok := cs.conns[connID]; ok {
+		// Another instance's SYN → just register additional source
+		existing.mu.Lock()
+		existing.sources = append(existing.sources, source)
+		existing.mu.Unlock()
 		cs.mu.Unlock()
 		return
 	}
 
-	// Parse target from SYN payload
 	atyp, addr, port, err := tunnel.DecodeSYNPayload(frame.Payload)
 	if err != nil {
 		cs.mu.Unlock()
@@ -253,7 +229,6 @@ func (cs *centralServer) handleSYN(frame *tunnel.Frame, source net.Conn) {
 		return
 	}
 
-	// Build target address for SOCKS5 CONNECT
 	var targetAddr string
 	switch atyp {
 	case 0x01:
@@ -268,7 +243,7 @@ func (cs *centralServer) handleSYN(frame *tunnel.Frame, source net.Conn) {
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &connState{
 		reorderer: tunnel.NewReorderer(),
-		sources:   map[io.Writer]bool{source: true},
+		sources:   []io.Writer{source},
 		cancel:    cancel,
 		created:   time.Now(),
 	}
@@ -276,72 +251,67 @@ func (cs *centralServer) handleSYN(frame *tunnel.Frame, source net.Conn) {
 	cs.mu.Unlock()
 
 	log.Printf("[central] conn=%d: SYN → target=%s", connID, targetAddr)
-
 	go cs.connectUpstream(ctx, connID, state, atyp, addr, port, targetAddr, source)
 }
 
-// connectUpstream establishes a SOCKS5 connection to the upstream proxy.
 func (cs *centralServer) connectUpstream(ctx context.Context, connID uint32, state *connState,
 	atyp byte, addr, port []byte, targetAddr string, source net.Conn) {
 
 	upConn, err := net.DialTimeout("tcp", cs.socksUpstream, 10*time.Second)
 	if err != nil {
 		log.Printf("[central] conn=%d: upstream dial failed: %v", connID, err)
-		cs.sendRST(connID, source)
+		cs.sendFrame(connID, &tunnel.Frame{ConnID: connID, Flags: tunnel.FlagRST | tunnel.FlagReverse})
 		cs.removeConn(connID)
 		return
 	}
-
 	if tc, ok := upConn.(*net.TCPConn); ok {
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
 		tc.SetNoDelay(true)
 	}
 
-	// SOCKS5 handshake with upstream
+	// SOCKS5 handshake
 	pipelined := make([]byte, 0, 3+4+len(addr)+2)
-	pipelined = append(pipelined, 0x05, 0x01, 0x00)       // greeting: no auth
-	pipelined = append(pipelined, 0x05, 0x01, 0x00, atyp) // CONNECT
+	pipelined = append(pipelined, 0x05, 0x01, 0x00)
+	pipelined = append(pipelined, 0x05, 0x01, 0x00, atyp)
 	pipelined = append(pipelined, addr...)
 	pipelined = append(pipelined, port...)
 
 	if _, err := upConn.Write(pipelined); err != nil {
 		log.Printf("[central] conn=%d: upstream write failed: %v", connID, err)
 		upConn.Close()
-		cs.sendRST(connID, source)
+		cs.sendFrame(connID, &tunnel.Frame{ConnID: connID, Flags: tunnel.FlagRST | tunnel.FlagReverse})
 		cs.removeConn(connID)
 		return
 	}
 
-	// Read greeting + CONNECT response
 	resp := make([]byte, 6)
 	if _, err := io.ReadFull(upConn, resp); err != nil {
 		log.Printf("[central] conn=%d: upstream response read failed: %v", connID, err)
 		upConn.Close()
-		cs.sendRST(connID, source)
+		cs.sendFrame(connID, &tunnel.Frame{ConnID: connID, Flags: tunnel.FlagRST | tunnel.FlagReverse})
 		cs.removeConn(connID)
 		return
 	}
 
 	// Drain bind address
-	repAtyp := resp[5]
-	switch repAtyp {
+	switch resp[5] {
 	case 0x01:
-		io.ReadFull(upConn, make([]byte, 4+2))
+		io.ReadFull(upConn, make([]byte, 6))
 	case 0x03:
-		lenBuf := make([]byte, 1)
-		io.ReadFull(upConn, lenBuf)
-		io.ReadFull(upConn, make([]byte, int(lenBuf[0])+2))
+		lb := make([]byte, 1)
+		io.ReadFull(upConn, lb)
+		io.ReadFull(upConn, make([]byte, int(lb[0])+2))
 	case 0x04:
-		io.ReadFull(upConn, make([]byte, 16+2))
+		io.ReadFull(upConn, make([]byte, 18))
 	default:
-		io.ReadFull(upConn, make([]byte, 4+2))
+		io.ReadFull(upConn, make([]byte, 6))
 	}
 
 	if resp[3] != 0x00 {
 		log.Printf("[central] conn=%d: upstream CONNECT rejected: 0x%02x", connID, resp[3])
 		upConn.Close()
-		cs.sendRST(connID, source)
+		cs.sendFrame(connID, &tunnel.Frame{ConnID: connID, Flags: tunnel.FlagRST | tunnel.FlagReverse})
 		cs.removeConn(connID)
 		return
 	}
@@ -349,7 +319,7 @@ func (cs *centralServer) connectUpstream(ctx context.Context, connID uint32, sta
 	state.mu.Lock()
 	state.target = upConn
 
-	// Flush any buffered data that arrived before upstream was ready
+	// Flush any data that arrived before upstream was ready
 	for {
 		data := state.reorderer.Next()
 		if data == nil {
@@ -357,7 +327,7 @@ func (cs *centralServer) connectUpstream(ctx context.Context, connID uint32, sta
 		}
 		if _, err := upConn.Write(data); err != nil {
 			state.mu.Unlock()
-			log.Printf("[central] conn=%d: flush buffered data failed: %v", connID, err)
+			log.Printf("[central] conn=%d: flush failed: %v", connID, err)
 			upConn.Close()
 			cs.removeConn(connID)
 			return
@@ -367,30 +337,19 @@ func (cs *centralServer) connectUpstream(ctx context.Context, connID uint32, sta
 
 	log.Printf("[central] conn=%d: upstream connected to %s", connID, targetAddr)
 
-	// Send ACK back
-	ack := &tunnel.Frame{
-		ConnID: connID,
-		SeqNum: 0,
-		Flags:  tunnel.FlagACK,
-	}
-	cs.broadcastFrame(connID, ack)
-
-	// Read upstream responses and send back through tunnel
-	go cs.relayUpstreamToTunnel(ctx, connID, state, upConn)
+	// Read upstream data and send back through tunnel (NO broadcast — round-robin)
+	cs.relayUpstreamToTunnel(ctx, connID, state, upConn)
 }
 
-// relayUpstreamToTunnel reads from the upstream SOCKS connection and sends
-// data back through the tunnel as reverse frames.
 func (cs *centralServer) relayUpstreamToTunnel(ctx context.Context, connID uint32,
 	state *connState, upstream net.Conn) {
 
 	defer func() {
 		upstream.Close()
-		fin := &tunnel.Frame{
+		cs.sendFrame(connID, &tunnel.Frame{
 			ConnID: connID,
 			Flags:  tunnel.FlagFIN | tunnel.FlagReverse,
-		}
-		cs.broadcastFrame(connID, fin)
+		})
 		cs.removeConn(connID)
 	}()
 
@@ -416,7 +375,9 @@ func (cs *centralServer) relayUpstreamToTunnel(ctx context.Context, connID uint3
 				Payload: make([]byte, n),
 			}
 			copy(frame.Payload, buf[:n])
-			cs.broadcastFrame(connID, frame)
+
+			// Send through ONE source (round-robin), NOT all
+			cs.sendFrame(connID, frame)
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -427,7 +388,42 @@ func (cs *centralServer) relayUpstreamToTunnel(ctx context.Context, connID uint3
 	}
 }
 
-// handleData processes incoming data frame.
+// sendFrame picks ONE source via round-robin and writes the frame.
+// If that source fails, tries the next one. Much better than broadcasting.
+func (cs *centralServer) sendFrame(connID uint32, frame *tunnel.Frame) {
+	cs.mu.RLock()
+	state, ok := cs.conns[connID]
+	cs.mu.RUnlock()
+	if !ok {
+		return
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if len(state.sources) == 0 {
+		return
+	}
+
+	// Try each source once, starting from current index
+	for tries := 0; tries < len(state.sources); tries++ {
+		idx := state.sourceIdx % len(state.sources)
+		state.sourceIdx++
+		w := state.sources[idx]
+
+		if err := tunnel.WriteFrame(w, frame); err != nil {
+			// Remove dead source
+			state.sources = append(state.sources[:idx], state.sources[idx+1:]...)
+			if state.sourceIdx > 0 {
+				state.sourceIdx--
+			}
+			continue
+		}
+		return // success
+	}
+	log.Printf("[central] conn=%d: all sources failed", connID)
+}
+
 func (cs *centralServer) handleData(frame *tunnel.Frame) {
 	cs.mu.RLock()
 	state, ok := cs.conns[frame.ConnID]
@@ -440,9 +436,8 @@ func (cs *centralServer) handleData(frame *tunnel.Frame) {
 	defer state.mu.Unlock()
 
 	state.reorderer.Insert(frame.SeqNum, frame.Payload)
-
 	if state.target == nil {
-		return // buffered, will flush when upstream connects
+		return // buffered, flushed when upstream connects
 	}
 
 	for {
@@ -457,7 +452,6 @@ func (cs *centralServer) handleData(frame *tunnel.Frame) {
 	}
 }
 
-// handleFIN handles connection teardown.
 func (cs *centralServer) handleFIN(frame *tunnel.Frame) {
 	cs.mu.RLock()
 	state, ok := cs.conns[frame.ConnID]
@@ -465,7 +459,6 @@ func (cs *centralServer) handleFIN(frame *tunnel.Frame) {
 	if !ok {
 		return
 	}
-
 	state.mu.Lock()
 	if state.target != nil {
 		for {
@@ -481,41 +474,11 @@ func (cs *centralServer) handleFIN(frame *tunnel.Frame) {
 	log.Printf("[central] conn=%d: FIN received", frame.ConnID)
 }
 
-// handleRST handles connection reset.
 func (cs *centralServer) handleRST(frame *tunnel.Frame) {
 	cs.removeConn(frame.ConnID)
 	log.Printf("[central] conn=%d: RST received", frame.ConnID)
 }
 
-// broadcastFrame sends a frame back through all registered sources.
-func (cs *centralServer) broadcastFrame(connID uint32, frame *tunnel.Frame) {
-	cs.mu.RLock()
-	state, ok := cs.conns[connID]
-	cs.mu.RUnlock()
-	if !ok {
-		return
-	}
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	for w := range state.sources {
-		if err := tunnel.WriteFrame(w, frame); err != nil {
-			delete(state.sources, w)
-		}
-	}
-}
-
-// sendRST sends a RST frame back to a specific source.
-func (cs *centralServer) sendRST(connID uint32, dest io.Writer) {
-	rst := &tunnel.Frame{
-		ConnID: connID,
-		Flags:  tunnel.FlagRST | tunnel.FlagReverse,
-	}
-	tunnel.WriteFrame(dest, rst)
-}
-
-// removeConn cleans up a connection.
 func (cs *centralServer) removeConn(connID uint32) {
 	cs.mu.Lock()
 	state, ok := cs.conns[connID]
@@ -528,7 +491,6 @@ func (cs *centralServer) removeConn(connID uint32) {
 	}
 }
 
-// closeAll closes all active connections.
 func (cs *centralServer) closeAll() {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -543,7 +505,6 @@ func (cs *centralServer) closeAll() {
 	}
 }
 
-// cleanupLoop removes stale connections.
 func (cs *centralServer) cleanupLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -558,7 +519,6 @@ func (cs *centralServer) cleanupLoop() {
 					state.cancel()
 				}
 				delete(cs.conns, id)
-				log.Printf("[central] conn=%d: removed stale connection", id)
 				continue
 			}
 			state.mu.Unlock()
