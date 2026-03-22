@@ -242,7 +242,7 @@ func (cs *centralServer) handleSYN(frame *tunnel.Frame, source net.Conn) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &connState{
-		reorderer: tunnel.NewReorderer(),
+		reorderer: tunnel.NewReordererAt(frame.SeqNum + 1), // skip SYN's SeqNum
 		sources:   []io.Writer{source},
 		cancel:    cancel,
 		created:   time.Now(),
