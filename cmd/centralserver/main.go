@@ -363,6 +363,7 @@ func (cs *centralServer) relayUpstreamToTunnel(ctx context.Context, connID uint3
 
 		n, err := upstream.Read(buf)
 		if n > 0 {
+			log.Printf("[central] conn=%d: upstream read %d bytes, sending reverse", connID, n)
 			state.mu.Lock()
 			seq := state.txSeq
 			state.txSeq++
@@ -405,6 +406,9 @@ func (cs *centralServer) sendFrame(connID uint32, frame *tunnel.Frame) {
 		return
 	}
 
+	log.Printf("[central] conn=%d: sendFrame seq=%d flags=0x%02x len=%d sources=%d",
+		connID, frame.SeqNum, frame.Flags, len(frame.Payload), len(state.sources))
+
 	// Try each source once, starting from current index
 	for tries := 0; tries < len(state.sources); tries++ {
 		idx := state.sourceIdx % len(state.sources)
@@ -412,6 +416,7 @@ func (cs *centralServer) sendFrame(connID uint32, frame *tunnel.Frame) {
 		w := state.sources[idx]
 
 		if err := tunnel.WriteFrame(w, frame); err != nil {
+			log.Printf("[central] conn=%d: sendFrame to source %d failed: %v", connID, idx, err)
 			// Remove dead source
 			state.sources = append(state.sources[:idx], state.sources[idx+1:]...)
 			if state.sourceIdx > 0 {
@@ -425,10 +430,12 @@ func (cs *centralServer) sendFrame(connID uint32, frame *tunnel.Frame) {
 }
 
 func (cs *centralServer) handleData(frame *tunnel.Frame) {
+	log.Printf("[central] conn=%d: DATA seq=%d len=%d", frame.ConnID, frame.SeqNum, len(frame.Payload))
 	cs.mu.RLock()
 	state, ok := cs.conns[frame.ConnID]
 	cs.mu.RUnlock()
 	if !ok {
+		log.Printf("[central] conn=%d: DATA for unknown connID, dropping", frame.ConnID)
 		return
 	}
 
