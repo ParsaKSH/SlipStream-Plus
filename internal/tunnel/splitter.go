@@ -162,6 +162,16 @@ func (ps *PacketSplitter) RelayUpstreamToClient(ctx context.Context, client io.W
 				return totalBytes
 			}
 
+			// Skip control frames (ACK, SYN) — only process data
+			if frame.IsACK() || frame.IsSYN() {
+				continue
+			}
+
+			// Skip empty payloads
+			if len(frame.Payload) == 0 {
+				continue
+			}
+
 			reorderer.Insert(frame.SeqNum, frame.Payload)
 
 			// Write all available in-order data
