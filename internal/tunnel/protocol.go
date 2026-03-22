@@ -53,28 +53,25 @@ func (f *Frame) IsACK() bool { return f.Flags&FlagACK != 0 }
 // IsReverse returns true if data flows from server to client.
 func (f *Frame) IsReverse() bool { return f.Flags&FlagReverse != 0 }
 
-// WriteFrame encodes the frame and writes it to w.
+// WriteFrame encodes the frame and writes it to w in a single write.
 // Wire format: [ConnID:4][SeqNum:4][Flags:1][Length:2][Payload:Length]
 func WriteFrame(w io.Writer, f *Frame) error {
 	if len(f.Payload) > MaxPayloadSize {
 		return fmt.Errorf("payload too large: %d > %d", len(f.Payload), MaxPayloadSize)
 	}
 
-	var hdr [HeaderSize]byte
-	binary.BigEndian.PutUint32(hdr[0:4], f.ConnID)
-	binary.BigEndian.PutUint32(hdr[4:8], f.SeqNum)
-	hdr[8] = f.Flags
-	binary.BigEndian.PutUint16(hdr[9:11], uint16(len(f.Payload)))
-
-	if _, err := w.Write(hdr[:]); err != nil {
-		return fmt.Errorf("write header: %w", err)
-	}
+	// Build entire frame in one buffer so it goes as a single TCP write
+	buf := make([]byte, HeaderSize+len(f.Payload))
+	binary.BigEndian.PutUint32(buf[0:4], f.ConnID)
+	binary.BigEndian.PutUint32(buf[4:8], f.SeqNum)
+	buf[8] = f.Flags
+	binary.BigEndian.PutUint16(buf[9:11], uint16(len(f.Payload)))
 	if len(f.Payload) > 0 {
-		if _, err := w.Write(f.Payload); err != nil {
-			return fmt.Errorf("write payload: %w", err)
-		}
+		copy(buf[HeaderSize:], f.Payload)
 	}
-	return nil
+
+	_, err := w.Write(buf)
+	return err
 }
 
 // ReadFrame reads one frame from r.
