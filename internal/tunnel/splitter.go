@@ -85,7 +85,6 @@ func (ps *PacketSplitter) SendSYN(atyp byte, addr []byte, port []byte) error {
 func (ps *PacketSplitter) RelayClientToUpstream(ctx context.Context, client io.Reader) int64 {
 	buf := make([]byte, ps.chunkSize)
 	var totalBytes int64
-	log.Printf("[splitter] conn=%d: RelayClientToUpstream STARTED", ps.connID)
 
 	for {
 		select {
@@ -95,7 +94,6 @@ func (ps *PacketSplitter) RelayClientToUpstream(ctx context.Context, client io.R
 		}
 
 		n, err := client.Read(buf)
-		log.Printf("[splitter] conn=%d: client.Read returned n=%d err=%v", ps.connID, n, err)
 		if n > 0 {
 			totalBytes += int64(n)
 
@@ -113,8 +111,6 @@ func (ps *PacketSplitter) RelayClientToUpstream(ctx context.Context, client io.R
 			}
 			copy(frame.Payload, buf[:n])
 
-			log.Printf("[splitter] conn=%d: sending DATA seq=%d len=%d via inst=%d",
-				ps.connID, frame.SeqNum, n, inst.ID())
 			if sendErr := ps.pool.SendFrame(inst.ID(), frame); sendErr != nil {
 				log.Printf("[splitter] conn=%d: send to instance %d failed: %v",
 					ps.connID, inst.ID(), sendErr)

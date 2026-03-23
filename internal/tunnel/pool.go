@@ -6,20 +6,32 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 )
 
+// tunnelMaxAge is how long a tunnel connection lives before being recycled.
+// Prevents QUIC stream degradation from long-lived connections.
+const tunnelMaxAge = 2 * time.Minute
+
+// writeTimeout is the maximum time a single frame write can take.
+// Prevents blocking all connections when QUIC flow control stalls.
+const writeTimeout = 10 * time.Second
+
 // TunnelConn wraps a persistent TCP connection to a single instance.
 // It multiplexes many logical connections (ConnIDs) over one TCP stream.
 type TunnelConn struct {
-	inst     *engine.Instance
-	mu       sync.Mutex
-	conn     net.Conn
-	writeMu  sync.Mutex
-	closed   bool
-	incoming chan *Frame // frames coming back from the instance
+	inst      *engine.Instance
+	mu        sync.Mutex
+	conn      net.Conn
+	writeMu   sync.Mutex
+	closed    bool
+	incoming  chan *Frame
+	createdAt time.Time
+	lastRead  atomic.Int64 // unix timestamp of last successful read
+	writeErrs atomic.Int32 // consecutive write errors
 }
 
 // TunnelPool manages persistent connections to all healthy instances.
@@ -62,7 +74,7 @@ func (p *TunnelPool) Start() {
 		}
 	}()
 
-	log.Printf("[tunnel-pool] started")
+	log.Printf("[tunnel-pool] started (max_age=%s, write_timeout=%s)", tunnelMaxAge, writeTimeout)
 }
 
 // Stop closes all tunnel connections.
@@ -89,7 +101,6 @@ func (p *TunnelPool) RegisterConn(connID uint32) chan *Frame {
 func (p *TunnelPool) UnregisterConn(connID uint32) {
 	if v, ok := p.handlers.LoadAndDelete(connID); ok {
 		ch := v.(chan *Frame)
-		// Drain and close
 		close(ch)
 	}
 }
@@ -122,28 +133,46 @@ func (p *TunnelPool) HealthyTunnelIDs() []int {
 }
 
 // refreshConnections ensures we have a tunnel to every healthy instance.
+// Also recycles connections that have exceeded their max age.
 func (p *TunnelPool) refreshConnections() {
 	healthy := p.mgr.HealthyInstances()
+	now := time.Now()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Remove tunnels for instances that are no longer healthy
+	// Remove tunnels that are unhealthy, closed, too old, or have too many write errors
 	activeIDs := make(map[int]bool)
 	for _, inst := range healthy {
 		activeIDs[inst.ID()] = true
 	}
 	for id, tc := range p.tunnels {
+		shouldRemove := false
+
 		if !activeIDs[id] || tc.closed {
+			shouldRemove = true
+		} else if now.Sub(tc.createdAt) > tunnelMaxAge {
+			// Connection too old → recycle to get a fresh QUIC stream
+			log.Printf("[tunnel-pool] recycling instance %d connection (age=%s)",
+				id, now.Sub(tc.createdAt).Round(time.Second))
+			shouldRemove = true
+		} else if tc.writeErrs.Load() > 3 {
+			// Too many consecutive write errors
+			log.Printf("[tunnel-pool] recycling instance %d connection (write_errors=%d)",
+				id, tc.writeErrs.Load())
+			shouldRemove = true
+		}
+
+		if shouldRemove {
 			tc.close()
 			delete(p.tunnels, id)
 		}
 	}
 
-	// Connect to new healthy instances
+	// Connect to healthy instances that don't have a tunnel
 	for _, inst := range healthy {
 		if inst.Config.Mode == "ssh" {
-			continue // Only SOCKS mode for packet splitting
+			continue
 		}
 		if _, exists := p.tunnels[inst.ID()]; exists {
 			continue
@@ -174,10 +203,12 @@ func (p *TunnelPool) connectInstance(inst *engine.Instance) (*TunnelConn, error)
 	}
 
 	tunnel := &TunnelConn{
-		inst:     inst,
-		conn:     conn,
-		incoming: make(chan *Frame, 256),
+		inst:      inst,
+		conn:      conn,
+		incoming:  make(chan *Frame, 256),
+		createdAt: time.Now(),
 	}
+	tunnel.lastRead.Store(time.Now().Unix())
 
 	// Start reader goroutine for this tunnel
 	p.wg.Add(1)
@@ -192,7 +223,6 @@ func (p *TunnelPool) connectInstance(inst *engine.Instance) (*TunnelConn, error)
 // readLoop continuously reads frames from a tunnel and dispatches them
 // to the appropriate ConnID handler.
 func (p *TunnelPool) readLoop(tc *TunnelConn) {
-	log.Printf("[tunnel-pool] readLoop started for instance %d", tc.inst.ID())
 	for {
 		select {
 		case <-p.stopCh:
@@ -209,8 +239,7 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 			return
 		}
 
-		log.Printf("[tunnel-pool] instance %d: received frame conn=%d seq=%d flags=0x%02x len=%d",
-			tc.inst.ID(), frame.ConnID, frame.SeqNum, frame.Flags, len(frame.Payload))
+		tc.lastRead.Store(time.Now().Unix())
 
 		// Route frame to the registered handler for this ConnID
 		if v, ok := p.handlers.Load(frame.ConnID); ok {
@@ -218,7 +247,6 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 			select {
 			case ch <- frame:
 			default:
-				// Handler's buffer is full, drop frame
 				log.Printf("[tunnel-pool] handler buffer full for conn %d, dropping frame seq=%d",
 					frame.ConnID, frame.SeqNum)
 			}
@@ -227,6 +255,7 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 }
 
 // writeFrame thread-safely writes a frame to the tunnel connection.
+// Includes a write deadline to prevent indefinite blocking.
 func (tc *TunnelConn) writeFrame(f *Frame) error {
 	tc.writeMu.Lock()
 	defer tc.writeMu.Unlock()
@@ -234,7 +263,18 @@ func (tc *TunnelConn) writeFrame(f *Frame) error {
 	if tc.closed {
 		return fmt.Errorf("tunnel closed")
 	}
-	return WriteFrame(tc.conn, f)
+
+	// Set write deadline to prevent blocking forever on stalled QUIC streams
+	tc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	err := WriteFrame(tc.conn, f)
+	tc.conn.SetWriteDeadline(time.Time{}) // clear deadline
+
+	if err != nil {
+		tc.writeErrs.Add(1)
+		return err
+	}
+	tc.writeErrs.Store(0) // reset on success
+	return nil
 }
 
 // close marks the tunnel as closed and closes the underlying connection.

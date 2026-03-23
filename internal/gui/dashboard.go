@@ -59,12 +59,16 @@ tr:hover td{background:rgba(124,108,255,0.03)}
 .ico{width:14px;height:14px;vertical-align:middle;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .btn .ico{width:12px;height:12px;margin-right:2px}
 .form-group{margin-bottom:14px}
-.form-group label{display:block;font-size:11px;color:var(--text2);margin-bottom:4px;font-weight:500}
+.form-group label{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text2);margin-bottom:4px;font-weight:500}
 .form-group input,.form-group select,.form-group textarea{width:100%;padding:8px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--rs);color:var(--text);font:13px inherit}
 .form-group input:focus,.form-group select:focus,.form-group textarea:focus{outline:none;border-color:var(--accent)}
 .form-group textarea{min-height:120px;font:11px 'SF Mono',Monaco,Consolas,monospace;resize:vertical}
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .form-row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+.tip-btn{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;border-radius:50%;background:var(--bg4);border:1px solid var(--border);color:var(--text3);font-size:9px;font-weight:700;cursor:pointer;position:relative;flex-shrink:0}
+.tip-btn:hover::after{content:attr(data-tip);position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);background:var(--bg4);border:1px solid var(--border);color:var(--text);font-size:10px;font-weight:400;padding:6px 10px;border-radius:6px;white-space:pre-line;width:220px;z-index:100;pointer-events:none;box-shadow:0 4px 20px rgba(0,0,0,0.4)}
+.cs-box{margin-top:10px;padding:14px;background:var(--bg2);border:1px solid rgba(124,108,255,0.25);border-radius:var(--rs)}
+.cs-box .cs-title{font-size:11px;font-weight:700;color:var(--accent2);margin-bottom:10px;text-transform:uppercase;letter-spacing:.8px}
 canvas{width:100%;height:200px;border-radius:var(--rs);background:var(--bg2);border:1px solid var(--border)}
 .toast{position:fixed;bottom:20px;right:20px;padding:10px 18px;background:var(--green);color:#fff;border-radius:var(--rs);font:500 12px inherit;opacity:0;transform:translateY(8px);transition:.3s;pointer-events:none;z-index:99}
 .toast.show{opacity:1;transform:translateY(0)}.toast.error{background:var(--red)}
@@ -205,8 +209,28 @@ canvas{width:100%;height:200px;border-radius:var(--rs);background:var(--bg2);bor
       </div>
       <div class="form-row">
         <div class="form-group"><label>SOCKS Listen</label><input id="cfg-listen" placeholder="0.0.0.0:1080"></div>
-        <div class="form-group"><label>Strategy</label>
-          <select id="cfg-strat"><option value="round_robin">Round Robin</option><option value="random">Random</option><option value="least_ping">Least Ping</option><option value="least_load">Least Load</option></select>
+        <div class="form-group">
+          <label>Strategy <span class="tip-btn" data-tip="round_robin: Rotate through instances evenly.&#10;random: Pick a random healthy instance.&#10;least_ping: Use instance with lowest latency.&#10;least_load: Use instance with fewest connections.&#10;packet_split: Split every connection across ALL instances at the packet level via CentralServer.">?</span></label>
+          <select id="cfg-strat" onchange="onStratChange()">
+            <option value="round_robin">Round Robin</option>
+            <option value="random">Random</option>
+            <option value="least_ping">Least Ping</option>
+            <option value="least_load">Least Load</option>
+            <option value="packet_split">Packet Split ★</option>
+          </select>
+        </div>
+      </div>
+      <div id="cfg-cs-box" class="cs-box" style="display:none">
+        <div class="cs-title">Central Server Settings</div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Address <span class="tip-btn" data-tip="Host:port of your centralserver binary&#10;(e.g. 45.89.223.100:9500).&#10;All slipstream-server instances must point&#10;their --target-address here.">?</span></label>
+            <input id="cfg-cs-addr" placeholder="45.89.223.100:9500">
+          </div>
+          <div class="form-group">
+            <label>Chunk Size <span class="tip-btn" data-tip="Max bytes per frame sent to centralserver.&#10;Default: 8192. Larger = fewer frames,&#10;smaller = lower latency. Range: 1024–65536.">?</span></label>
+            <input type="number" id="cfg-cs-chunk" placeholder="8192">
+          </div>
         </div>
       </div>
       <div class="form-row">
@@ -435,6 +459,10 @@ async function restartInst(id){
 
 // ─── Config ───
 async function loadCfg(){try{const r=await fetch('/api/config');CC=await r.json()}catch(e){}}
+function onStratChange(){
+  const ps=document.getElementById('cfg-strat').value==='packet_split';
+  document.getElementById('cfg-cs-box').style.display=ps?'block':'none';
+}
 function fillForm(c){
   document.getElementById('cfg-listen').value=c.socks?.listen||'';
   document.getElementById('cfg-strat').value=c.strategy||'round_robin';
@@ -442,6 +470,11 @@ function fillForm(c){
   document.getElementById('cfg-max').value=c.socks?.max_connections||10000;
   document.getElementById('cfg-hi').value=c.health_check?.interval||'30s';
   document.getElementById('cfg-ht').value=c.health_check?.timeout||'30s';
+  // Central server
+  const cs=c.central_server||{};
+  document.getElementById('cfg-cs-addr').value=cs.address||'';
+  document.getElementById('cfg-cs-chunk').value=cs.chunk_size||8192;
+  onStratChange();
 }
 async function saveConfig(){
   try{
@@ -452,6 +485,10 @@ async function saveConfig(){
     CC.strategy=document.getElementById('cfg-strat').value;
     CC.health_check.interval=document.getElementById('cfg-hi').value;
     CC.health_check.timeout=document.getElementById('cfg-ht').value;
+    // Central server (only relevant for packet_split)
+    if(!CC.central_server)CC.central_server={};
+    CC.central_server.address=document.getElementById('cfg-cs-addr').value;
+    CC.central_server.chunk_size=parseInt(document.getElementById('cfg-cs-chunk').value)||8192;
     const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(CC)});
     if(!r.ok){toast(await r.text(),true);return}toast('Config saved!')
   }catch(e){toast('Save failed',true)}

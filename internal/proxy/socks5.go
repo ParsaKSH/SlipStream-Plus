@@ -248,6 +248,16 @@ func (s *Server) handlePacketSplit(clientConn net.Conn, connID uint64, atyp byte
 		return
 	}
 
+	// Track connections on all used instances
+	for _, inst := range socksHealthy {
+		inst.IncrConns()
+	}
+	defer func() {
+		for _, inst := range socksHealthy {
+			inst.DecrConns()
+		}
+	}()
+
 	// Create a packet splitter for this connection
 	tunnelConnID := s.connIDGen.Next()
 	splitter := tunnel.NewPacketSplitter(tunnelConnID, s.tunnelPool, socksHealthy, s.chunkSize)
@@ -267,11 +277,9 @@ func (s *Server) handlePacketSplit(clientConn net.Conn, connID uint64, atyp byte
 	log.Printf("[proxy] conn#%d: packet-split mode, %d instances, port %d",
 		connID, len(socksHealthy), port)
 
-	// Create a context that cancels when any instance in the pool dies
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Bidirectional relay using packet splitter
 	var txN, rxN int64
 	var wg sync.WaitGroup
 
@@ -300,6 +308,17 @@ func (s *Server) handlePacketSplit(clientConn net.Conn, connID uint64, atyp byte
 	}()
 
 	wg.Wait()
+
+	// Track TX/RX on instances (distributed proportionally)
+	nInstances := int64(len(socksHealthy))
+	if nInstances > 0 {
+		txPer := txN / nInstances
+		rxPer := rxN / nInstances
+		for _, inst := range socksHealthy {
+			inst.AddTx(txPer)
+			inst.AddRx(rxPer)
+		}
+	}
 
 	// Track bytes for user data quota
 	if user != nil {
