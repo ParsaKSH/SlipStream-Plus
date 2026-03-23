@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -141,13 +142,22 @@ func (cs *centralServer) handleSOCKS5Passthrough(clientConn net.Conn, firstByte 
 }
 
 // handleFrameConn reads framed packets from a tunnel connection.
+// When this function returns (source TCP died), it cleans up all
+// connStates that had this as their only source.
 func (cs *centralServer) handleFrameConn(conn net.Conn, firstByte byte, remoteAddr string) {
 	log.Printf("[central] frame connection from %s", remoteAddr)
+
+	// Track which ConnIDs this source served
+	servedIDs := make(map[uint32]bool)
+
+	defer func() {
+		// Source TCP died — clean up connStates that only had this source
+		cs.cleanupSource(conn, servedIDs, remoteAddr)
+	}()
 
 	// Read remaining header bytes (we already read 1)
 	var hdrRest [tunnel.HeaderSize - 1]byte
 	if _, err := io.ReadFull(conn, hdrRest[:]); err != nil {
-		log.Printf("[central] %s: frame header read error: %v", remoteAddr, err)
 		return
 	}
 
@@ -157,19 +167,73 @@ func (cs *centralServer) handleFrameConn(conn net.Conn, firstByte byte, remoteAd
 
 	firstFrame := cs.parseHeader(fullHdr, conn, remoteAddr)
 	if firstFrame != nil {
+		servedIDs[firstFrame.ConnID] = true
 		cs.dispatchFrame(firstFrame, conn)
 	}
 
 	for {
 		frame, err := tunnel.ReadFrame(conn)
 		if err != nil {
-			if err != io.EOF {
+			if err != io.EOF && !isClosedConnErr(err) {
 				log.Printf("[central] %s: read error: %v", remoteAddr, err)
 			}
 			return
 		}
+		servedIDs[frame.ConnID] = true
 		cs.dispatchFrame(frame, conn)
 	}
+}
+
+// cleanupSource removes a dead source connection from all connStates.
+// If a connState has no remaining sources, it is fully cleaned up.
+func (cs *centralServer) cleanupSource(deadSource net.Conn, servedIDs map[uint32]bool, remoteAddr string) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	cleaned := 0
+	for connID := range servedIDs {
+		state, ok := cs.conns[connID]
+		if !ok {
+			continue
+		}
+
+		state.mu.Lock()
+		// Remove dead source from sources list
+		for i, src := range state.sources {
+			if src == deadSource {
+				state.sources = append(state.sources[:i], state.sources[i+1:]...)
+				break
+			}
+		}
+
+		// If no sources left, fully clean up this connState
+		if len(state.sources) == 0 {
+			state.mu.Unlock()
+			if state.cancel != nil {
+				state.cancel()
+			}
+			if state.target != nil {
+				state.target.Close()
+			}
+			delete(cs.conns, connID)
+			cleaned++
+		} else {
+			state.mu.Unlock()
+		}
+	}
+
+	if cleaned > 0 {
+		log.Printf("[central] %s: source disconnected, cleaned %d orphaned connections", remoteAddr, cleaned)
+	}
+}
+
+func isClosedConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "use of closed network connection") ||
+		strings.Contains(s, "connection reset by peer")
 }
 
 func (cs *centralServer) parseHeader(hdr [tunnel.HeaderSize]byte, conn net.Conn, remoteAddr string) *tunnel.Frame {
@@ -380,7 +444,7 @@ func (cs *centralServer) relayUpstreamToTunnel(ctx context.Context, connID uint3
 			cs.sendFrame(connID, frame)
 		}
 		if err != nil {
-			if err != io.EOF {
+			if err != io.EOF && !isClosedConnErr(err) {
 				log.Printf("[central] conn=%d: upstream read error: %v", connID, err)
 			}
 			return
