@@ -192,7 +192,6 @@ func (p *TunnelPool) connectInstance(inst *engine.Instance) (*TunnelConn, error)
 // readLoop continuously reads frames from a tunnel and dispatches them
 // to the appropriate ConnID handler.
 func (p *TunnelPool) readLoop(tc *TunnelConn) {
-	log.Printf("[tunnel-pool] readLoop started for instance %d", tc.inst.ID())
 	for {
 		select {
 		case <-p.stopCh:
@@ -208,9 +207,6 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 			tc.close()
 			return
 		}
-
-		log.Printf("[tunnel-pool] instance %d: received frame conn=%d seq=%d flags=0x%02x len=%d",
-			tc.inst.ID(), frame.ConnID, frame.SeqNum, frame.Flags, len(frame.Payload))
 
 		// Route frame to the registered handler for this ConnID
 		if v, ok := p.handlers.Load(frame.ConnID); ok {
