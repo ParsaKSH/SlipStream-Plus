@@ -272,6 +272,7 @@ func (s *Server) handlePacketSplit(clientConn net.Conn, connID uint64, atyp byte
 
 	// Tell client: connection successful
 	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	log.Printf("[proxy] conn#%d: packet-split SYN sent, connID=%d", connID, tunnelConnID)
 
 	port := binary.BigEndian.Uint16(portBytes)
 	log.Printf("[proxy] conn#%d: packet-split mode, %d instances, port %d",
@@ -308,6 +309,7 @@ func (s *Server) handlePacketSplit(clientConn net.Conn, connID uint64, atyp byte
 	}()
 
 	wg.Wait()
+	log.Printf("[proxy] conn#%d: packet-split done, tx=%d rx=%d", connID, txN, rxN)
 
 	// Track TX/RX on instances (distributed proportionally)
 	nInstances := int64(len(socksHealthy))

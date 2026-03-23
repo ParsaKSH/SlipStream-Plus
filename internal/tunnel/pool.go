@@ -220,6 +220,12 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 
 		tc.lastRead.Store(time.Now().UnixMilli())
 
+		// Diagnostic: log reverse frames (data coming back from instances)
+		if frame.IsReverse() || frame.IsFIN() || frame.IsRST() {
+			log.Printf("[tunnel-pool] instance %d: recv frame conn=%d seq=%d flags=0x%02x len=%d",
+				tc.inst.ID(), frame.ConnID, frame.SeqNum, frame.Flags, len(frame.Payload))
+		}
+
 		if v, ok := p.handlers.Load(frame.ConnID); ok {
 			ch := v.(chan *Frame)
 			select {
