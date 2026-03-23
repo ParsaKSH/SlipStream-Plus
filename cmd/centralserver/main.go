@@ -524,17 +524,38 @@ func (cs *centralServer) cleanupLoop() {
 	for range ticker.C {
 		cs.mu.Lock()
 		now := time.Now()
+		cleaned := 0
 		for id, state := range cs.conns {
 			state.mu.Lock()
-			if state.target == nil && now.Sub(state.created) > 10*time.Minute {
-				state.mu.Unlock()
+			shouldClean := false
+
+			// No upstream established after 2 minutes = stuck
+			if state.target == nil && now.Sub(state.created) > 2*time.Minute {
+				shouldClean = true
+			}
+			// No sources left = all tunnel connections died
+			if len(state.sources) == 0 && now.Sub(state.created) > 30*time.Second {
+				shouldClean = true
+			}
+			// Connection too old (5 min max lifetime)
+			if now.Sub(state.created) > 5*time.Minute {
+				shouldClean = true
+			}
+
+			state.mu.Unlock()
+			if shouldClean {
 				if state.cancel != nil {
 					state.cancel()
 				}
+				if state.target != nil {
+					state.target.Close()
+				}
 				delete(cs.conns, id)
-				continue
+				cleaned++
 			}
-			state.mu.Unlock()
+		}
+		if cleaned > 0 {
+			log.Printf("[central] cleanup: removed %d stale connections (%d active)", cleaned, len(cs.conns))
 		}
 		cs.mu.Unlock()
 	}
