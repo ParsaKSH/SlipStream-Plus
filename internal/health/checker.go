@@ -12,6 +12,7 @@ import (
 
 	"github.com/ParsaKSH/SlipStream-Plus/internal/config"
 	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/tunnel"
 )
 
 // An instance is HEALTHY only after a successful tunnel probe (SOCKS5/SSH).
@@ -23,12 +24,13 @@ import (
 const maxConsecutiveFailures = 3
 
 type Checker struct {
-	manager  *engine.Manager
-	interval time.Duration
-	timeout  time.Duration
-	target   string // health_check.target (e.g. "google.com")
-	ctx      context.Context
-	cancel   context.CancelFunc
+	manager     *engine.Manager
+	interval    time.Duration
+	timeout     time.Duration
+	target      string // health_check.target (e.g. "google.com")
+	packetSplit bool   // true when strategy=packet_split
+	ctx         context.Context
+	cancel      context.CancelFunc
 
 	mu       sync.Mutex
 	failures map[int]int
@@ -55,8 +57,18 @@ func NewChecker(mgr *engine.Manager, cfg *config.HealthCheckConfig) *Checker {
 
 func (c *Checker) Start() {
 	go c.run()
-	log.Printf("[health] checker started (interval=%s, tunnel_timeout=%s, target=%s, unhealthy_after=%d failures)",
-		c.interval, c.timeout, c.target, maxConsecutiveFailures)
+	mode := "connection"
+	if c.packetSplit {
+		mode = "packet-split"
+	}
+	log.Printf("[health] checker started (interval=%s, tunnel_timeout=%s, target=%s, mode=%s, unhealthy_after=%d failures)",
+		c.interval, c.timeout, c.target, mode, maxConsecutiveFailures)
+}
+
+// SetPacketSplit enables framing protocol health checks.
+// Must be called before Start().
+func (c *Checker) SetPacketSplit(enabled bool) {
+	c.packetSplit = enabled
 }
 
 func (c *Checker) Stop() {
@@ -159,10 +171,19 @@ func (c *Checker) checkOne(inst *engine.Instance) {
 		return
 	}
 
-	// Step 3: End-to-end probe — full SOCKS5 CONNECT + HTTP through tunnel.
-	// Tests entire path: instance → DNS tunnel → target server → SOCKS → internet.
+	// Step 3: End-to-end probe.
+	// In packet_split mode: test if instance's upstream speaks our framing protocol.
+	// In normal mode: full SOCKS5 CONNECT + HTTP through the tunnel.
 	if c.target != "" && inst.Config.Mode != "ssh" {
-		e2eRtt, e2eErr := c.probeEndToEnd(inst)
+		var e2eRtt time.Duration
+		var e2eErr error
+
+		if c.packetSplit {
+			e2eRtt, e2eErr = c.probeFramingProtocol(inst)
+		} else {
+			e2eRtt, e2eErr = c.probeEndToEnd(inst)
+		}
+
 		if e2eErr != nil {
 			failCount := c.recordFailure(inst.ID())
 			if failCount >= maxConsecutiveFailures {
@@ -321,6 +342,68 @@ func (c *Checker) probeEndToEnd(inst *engine.Instance) (time.Duration, error) {
 	if n < 12 || string(respBuf[:4]) != "HTTP" {
 		return 0, fmt.Errorf("e2e bad http response: %q", string(respBuf[:n]))
 	}
+
+	return time.Since(start), nil
+}
+
+// probeFramingProtocol tests if the instance's upstream speaks our framing protocol
+// (i.e., is connected to centralserver). It sends a SYN frame and expects a valid
+// frame response. Instances whose upstream is a plain SOCKS5 proxy will fail.
+func (c *Checker) probeFramingProtocol(inst *engine.Instance) (time.Duration, error) {
+	start := time.Now()
+
+	conn, err := net.DialTimeout("tcp", inst.Addr(), c.timeout)
+	if err != nil {
+		return 0, fmt.Errorf("frame probe connect: %w", err)
+	}
+	defer conn.Close()
+
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+	conn.SetDeadline(time.Now().Add(c.timeout))
+
+	// Build SYN targeting health_check.target:80
+	domain := c.target
+	synPayload := make([]byte, 0, 1+1+len(domain)+2)
+	synPayload = append(synPayload, 0x03)              // ATYP = domain
+	synPayload = append(synPayload, byte(len(domain))) // domain length
+	synPayload = append(synPayload, []byte(domain)...) // domain
+	synPayload = append(synPayload, 0x00, 0x50)        // port 80
+
+	// Use a unique probe ConnID (high range to avoid collision)
+	probeConnID := uint32(0xFFFF0000) + uint32(inst.ID())
+
+	synFrame := &tunnel.Frame{
+		ConnID:  probeConnID,
+		SeqNum:  0,
+		Flags:   tunnel.FlagSYN,
+		Payload: synPayload,
+	}
+
+	if err := tunnel.WriteFrame(conn, synFrame); err != nil {
+		return 0, fmt.Errorf("frame probe write SYN: %w", err)
+	}
+
+	// Read response frame from centralserver.
+	// If upstream is centralserver → valid frame back.
+	// If upstream is plain SOCKS5 → timeout/garbage → fail.
+	respFrame, err := tunnel.ReadFrame(conn)
+	if err != nil {
+		return 0, fmt.Errorf("frame probe read: %w", err)
+	}
+
+	if respFrame.ConnID != probeConnID {
+		return 0, fmt.Errorf("frame probe wrong connID: got %d, want %d",
+			respFrame.ConnID, probeConnID)
+	}
+
+	// Valid frame = centralserver is there. Send FIN to clean up.
+	tunnel.WriteFrame(conn, &tunnel.Frame{
+		ConnID: probeConnID,
+		SeqNum: 1,
+		Flags:  tunnel.FlagFIN,
+	})
 
 	return time.Since(start), nil
 }

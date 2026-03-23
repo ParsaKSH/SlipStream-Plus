@@ -78,6 +78,9 @@ func main() {
 
 	// Health checker
 	checker := health.NewChecker(mgr, &cfg.HealthCheck)
+	if cfg.Strategy == "packet_split" {
+		checker.SetPacketSplit(true)
+	}
 	checker.Start()
 
 	// Load balancer
