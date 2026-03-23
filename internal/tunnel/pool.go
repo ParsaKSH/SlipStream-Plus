@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -30,8 +31,9 @@ type TunnelConn struct {
 	closed    bool
 	incoming  chan *Frame
 	createdAt time.Time
-	lastRead  atomic.Int64 // unix timestamp of last successful read
-	writeErrs atomic.Int32 // consecutive write errors
+	maxAge    time.Duration // per-connection jittered max age
+	lastRead  atomic.Int64  // unix timestamp of last successful read
+	writeErrs atomic.Int32  // consecutive write errors
 }
 
 // TunnelPool manages persistent connections to all healthy instances.
@@ -151,8 +153,7 @@ func (p *TunnelPool) refreshConnections() {
 
 		if !activeIDs[id] || tc.closed {
 			shouldRemove = true
-		} else if now.Sub(tc.createdAt) > tunnelMaxAge {
-			// Connection too old → recycle to get a fresh QUIC stream
+		} else if now.Sub(tc.createdAt) > tc.maxAge {
 			log.Printf("[tunnel-pool] recycling instance %d connection (age=%s)",
 				id, now.Sub(tc.createdAt).Round(time.Second))
 			shouldRemove = true
@@ -202,11 +203,15 @@ func (p *TunnelPool) connectInstance(inst *engine.Instance) (*TunnelConn, error)
 		tc.SetNoDelay(true)
 	}
 
+	// Jittered max age: tunnelMaxAge ± 50%
+	jitter := time.Duration(rand.Int63n(int64(tunnelMaxAge))) - tunnelMaxAge/2
+
 	tunnel := &TunnelConn{
 		inst:      inst,
 		conn:      conn,
 		incoming:  make(chan *Frame, 256),
 		createdAt: time.Now(),
+		maxAge:    tunnelMaxAge + jitter,
 	}
 	tunnel.lastRead.Store(time.Now().Unix())
 
