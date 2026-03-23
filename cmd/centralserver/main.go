@@ -206,7 +206,7 @@ func (cs *centralServer) dispatchFrame(frame *tunnel.Frame, source net.Conn) {
 		cs.handleRST(frame)
 		return
 	}
-	cs.handleData(frame)
+	cs.handleData(frame, source)
 }
 
 func (cs *centralServer) handleSYN(frame *tunnel.Frame, source net.Conn) {
@@ -424,7 +424,7 @@ func (cs *centralServer) sendFrame(connID uint32, frame *tunnel.Frame) {
 	log.Printf("[central] conn=%d: all sources failed", connID)
 }
 
-func (cs *centralServer) handleData(frame *tunnel.Frame) {
+func (cs *centralServer) handleData(frame *tunnel.Frame, source net.Conn) {
 	cs.mu.RLock()
 	state, ok := cs.conns[frame.ConnID]
 	cs.mu.RUnlock()
@@ -434,6 +434,19 @@ func (cs *centralServer) handleData(frame *tunnel.Frame) {
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
+
+	// If this source isn't known yet (e.g., after tunnel recycling), add it.
+	// This ensures responses can flow back through the new connection.
+	found := false
+	for _, s := range state.sources {
+		if s == source {
+			found = true
+			break
+		}
+	}
+	if !found {
+		state.sources = append(state.sources, source)
+	}
 
 	state.reorderer.Insert(frame.SeqNum, frame.Payload)
 	if state.target == nil {
