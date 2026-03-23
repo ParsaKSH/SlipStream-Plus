@@ -385,9 +385,21 @@ func (c *Checker) probeFramingProtocol(inst *engine.Instance) (time.Duration, er
 		return 0, fmt.Errorf("frame probe write SYN: %w", err)
 	}
 
+	// Send DATA with HTTP HEAD so the target actually responds
+	httpReq := fmt.Sprintf("HEAD / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", domain)
+	dataFrame := &tunnel.Frame{
+		ConnID:  probeConnID,
+		SeqNum:  1,
+		Flags:   tunnel.FlagData,
+		Payload: []byte(httpReq),
+	}
+	if err := tunnel.WriteFrame(conn, dataFrame); err != nil {
+		return 0, fmt.Errorf("frame probe write DATA: %w", err)
+	}
+
 	// Read response frame from centralserver.
-	// If upstream is centralserver → valid frame back.
-	// If upstream is plain SOCKS5 → timeout/garbage → fail.
+	// centralserver → connects target, forwards HTTP, target responds → reverse frame.
+	// plain SOCKS5 → can't parse frame → timeout/error.
 	respFrame, err := tunnel.ReadFrame(conn)
 	if err != nil {
 		return 0, fmt.Errorf("frame probe read: %w", err)
@@ -401,7 +413,7 @@ func (c *Checker) probeFramingProtocol(inst *engine.Instance) (time.Duration, er
 	// Valid frame = centralserver is there. Send FIN to clean up.
 	tunnel.WriteFrame(conn, &tunnel.Frame{
 		ConnID: probeConnID,
-		SeqNum: 1,
+		SeqNum: 2,
 		Flags:  tunnel.FlagFIN,
 	})
 
