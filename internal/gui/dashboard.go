@@ -224,8 +224,8 @@ canvas{width:100%;height:200px;border-radius:var(--rs);background:var(--bg2);bor
         <div class="cs-title">Central Server Settings</div>
         <div class="form-row">
           <div class="form-group">
-            <label>Address <span class="tip-btn" data-tip="Host:port of your centralserver binary&#10;(e.g. 45.89.223.100:9500).&#10;All slipstream-server instances must point&#10;their --target-address here.">?</span></label>
-            <input id="cfg-cs-addr" placeholder="45.89.223.100:9500">
+            <label>Address <span class="tip-btn" data-tip="Host:port of your centralserver binary&#10;(e.g. 192.168.1.1:9500).&#10;All slipstream-server instances must point&#10;their --target-address here.">?</span></label>
+            <input id="cfg-cs-addr" placeholder="192.168.1.1:9500">
           </div>
           <div class="form-group">
             <label>Chunk Size <span class="tip-btn" data-tip="Max bytes per frame sent to centralserver.&#10;Default: 8192. Larger = fewer frames,&#10;smaller = lower latency. Range: 1024–65536.">?</span></label>
