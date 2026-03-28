@@ -230,8 +230,12 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 			ch := v.(chan *Frame)
 			select {
 			case ch <- frame:
-			default:
-				// Buffer full — drop silently
+			case <-time.After(5 * time.Second):
+				// Buffer full for too long — connection is stuck, log and drop
+				log.Printf("[tunnel-pool] instance %d: frame buffer full for conn=%d, dropping frame seq=%d",
+					tc.inst.ID(), frame.ConnID, frame.SeqNum)
+			case <-p.stopCh:
+				return
 			}
 		}
 	}
