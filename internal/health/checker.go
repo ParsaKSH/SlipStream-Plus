@@ -2,12 +2,14 @@ package health
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ParsaKSH/SlipStream-Plus/internal/config"
@@ -34,6 +36,8 @@ type Checker struct {
 
 	mu       sync.Mutex
 	failures map[int]int
+
+	probeSeq atomic.Uint32 // unique probe counter to avoid ConnID collisions
 }
 
 func NewChecker(mgr *engine.Manager, cfg *config.HealthCheckConfig) *Checker {
@@ -371,8 +375,14 @@ func (c *Checker) probeFramingProtocol(inst *engine.Instance) (time.Duration, er
 	synPayload = append(synPayload, []byte(domain)...) // domain
 	synPayload = append(synPayload, 0x00, 0x50)        // port 80
 
-	// Use a unique probe ConnID (high range to avoid collision)
-	probeConnID := uint32(0xFFFF0000) + uint32(inst.ID())
+	// Use a unique probe ConnID combining high-range prefix, instance ID,
+	// monotonic counter, and random bits to avoid collisions with real connections
+	// and previous probes that haven't been cleaned up yet.
+	seq := c.probeSeq.Add(1)
+	var rndBuf [2]byte
+	rand.Read(rndBuf[:])
+	rnd := uint32(binary.BigEndian.Uint16(rndBuf[:]))
+	probeConnID := uint32(0xFE000000) | (uint32(inst.ID())&0xFF)<<16 | (seq&0xFF)<<8 | (rnd & 0xFF)
 
 	synFrame := &tunnel.Frame{
 		ConnID:  probeConnID,

@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -104,8 +105,25 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 }
 
 // ConnIDGenerator produces unique connection IDs.
+// Starts from a random offset to avoid collisions after process restarts
+// while CentralServer still holds state from the previous session.
 type ConnIDGenerator struct {
 	counter atomic.Uint32
+}
+
+// NewConnIDGenerator creates a generator with a random starting offset.
+func NewConnIDGenerator() *ConnIDGenerator {
+	g := &ConnIDGenerator{}
+	// Random start in [1, 0x7FFFFFFF) — avoids 0 and leaves room before wrap
+	var buf [4]byte
+	if _, err := rand.Read(buf[:]); err == nil {
+		start := binary.BigEndian.Uint32(buf[:]) & 0x7FFFFFFF
+		if start == 0 {
+			start = 1
+		}
+		g.counter.Store(start)
+	}
+	return g
 }
 
 // Next returns the next unique connection ID.

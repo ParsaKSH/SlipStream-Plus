@@ -34,7 +34,7 @@ type Server struct {
 	// Packet-split mode fields
 	packetSplit bool
 	tunnelPool  *tunnel.TunnelPool
-	connIDGen   tunnel.ConnIDGenerator
+	connIDGen   *tunnel.ConnIDGenerator
 	chunkSize   int
 }
 
@@ -53,6 +53,7 @@ func NewServer(listenAddr string, bufferSize int, maxConns int, mgr *engine.Mana
 func (s *Server) EnablePacketSplit(pool *tunnel.TunnelPool, chunkSize int) {
 	s.packetSplit = true
 	s.tunnelPool = pool
+	s.connIDGen = tunnel.NewConnIDGenerator()
 	s.chunkSize = chunkSize
 	log.Printf("[proxy] packet-split mode enabled (chunk_size=%d)", chunkSize)
 }
@@ -280,6 +281,13 @@ func (s *Server) handlePacketSplit(clientConn net.Conn, connID uint64, atyp byte
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// When context is cancelled (either direction finished), close the client
+	// connection so that blocking Read/Write calls unblock immediately.
+	go func() {
+		<-ctx.Done()
+		clientConn.Close()
+	}()
 
 	var txN, rxN int64
 	var wg sync.WaitGroup
