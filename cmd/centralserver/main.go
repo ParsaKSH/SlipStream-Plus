@@ -39,6 +39,7 @@ type connState struct {
 	txSeq     uint32 // next sequence number for reverse data
 	cancel    context.CancelFunc
 	created   time.Time
+	lastActive time.Time // last time data was sent or received
 
 	// Sources: all tunnel connections that can carry reverse data.
 	// We round-robin responses across them (not broadcast).
@@ -345,12 +346,14 @@ func (cs *centralServer) handleSYN(frame *tunnel.Frame, source *sourceConn) {
 		targetAddr = fmt.Sprintf("[%s]:%d", net.IP(addr).String(), binary.BigEndian.Uint16(port))
 	}
 
+	now := time.Now()
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &connState{
-		reorderer: tunnel.NewReordererAt(frame.SeqNum + 1), // skip SYN's SeqNum
-		sources:   []*sourceConn{source},
-		cancel:    cancel,
-		created:   time.Now(),
+		reorderer:  tunnel.NewReordererAt(frame.SeqNum + 1), // skip SYN's SeqNum
+		sources:    []*sourceConn{source},
+		cancel:     cancel,
+		created:    now,
+		lastActive: now,
 	}
 	cs.conns[connID] = state
 	cs.mu.Unlock()
@@ -475,6 +478,7 @@ func (cs *centralServer) relayUpstreamToTunnel(ctx context.Context, connID uint3
 			state.mu.Lock()
 			seq := state.txSeq
 			state.txSeq++
+			state.lastActive = time.Now()
 			state.mu.Unlock()
 
 			frame := &tunnel.Frame{
@@ -558,6 +562,7 @@ func (cs *centralServer) handleData(frame *tunnel.Frame, source *sourceConn) {
 		state.sources = append(state.sources, source)
 	}
 
+	state.lastActive = time.Now()
 	state.reorderer.Insert(frame.SeqNum, frame.Payload)
 	if state.target == nil {
 		return // buffered, flushed when upstream connects
@@ -632,7 +637,7 @@ func (cs *centralServer) closeAll() {
 }
 
 func (cs *centralServer) cleanupLoop() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		cs.mu.Lock()
@@ -642,16 +647,19 @@ func (cs *centralServer) cleanupLoop() {
 			state.mu.Lock()
 			shouldClean := false
 
-			// No upstream established after 2 minutes = stuck
-			if state.target == nil && now.Sub(state.created) > 2*time.Minute {
+			// No upstream established after 60 seconds = stuck
+			if state.target == nil && now.Sub(state.created) > 60*time.Second {
 				shouldClean = true
 			}
 			// No sources left = all tunnel connections died
 			if len(state.sources) == 0 && now.Sub(state.created) > 30*time.Second {
 				shouldClean = true
 			}
-			// No max lifetime — long-lived connections (downloads, streams)
-			// are valid. Cleanup only based on actual broken state above.
+			// Idle for too long — no data sent or received in 60 seconds.
+			// This catches stuck connections where both sides stopped talking.
+			if now.Sub(state.lastActive) > 60*time.Second {
+				shouldClean = true
+			}
 
 			state.mu.Unlock()
 			if shouldClean {

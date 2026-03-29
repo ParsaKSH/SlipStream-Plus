@@ -7,6 +7,7 @@ slipstrampluss
 slipstreampluss
 SlipStreamPlus.tar.gz
 centralserver
+central
 slipstreamplusb
 # Rust core binaries (built by CI from source)
 slipstreamorg/slipstream-client-*
