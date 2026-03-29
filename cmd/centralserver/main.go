@@ -51,6 +51,11 @@ type connState struct {
 	// We round-robin responses across them (not broadcast).
 	sources   []*sourceConn
 	sourceIdx int
+
+	// Async write queue: handleData sends chunks here instead of writing
+	// to target synchronously (which would block the frame dispatch loop).
+	// The upstreamWriter goroutine drains this channel and writes to target.
+	writeCh chan []byte
 }
 
 // centralServer manages all active connections.
@@ -434,10 +439,14 @@ func (cs *centralServer) connectUpstream(ctx context.Context, connID uint32, sta
 		io.ReadFull(upConn, make([]byte, 6))
 	}
 
+	// Create async write channel and set target under lock
+	writeCh := make(chan []byte, 256)
+
 	state.mu.Lock()
 	state.target = upConn
+	state.writeCh = writeCh
 
-	// Drain buffered data under lock, then write outside
+	// Drain any data that arrived before upstream was ready
 	var flushChunks [][]byte
 	for {
 		data := state.reorderer.Next()
@@ -448,18 +457,16 @@ func (cs *centralServer) connectUpstream(ctx context.Context, connID uint32, sta
 	}
 	state.mu.Unlock()
 
-	// Flush outside lock
+	// Start async writer goroutine — all writes to upstream go through writeCh
+	go cs.upstreamWriter(ctx, connID, upConn, writeCh)
+
+	// Send flush data through the channel (channel is empty, won't block)
 	for _, data := range flushChunks {
-		upConn.SetWriteDeadline(time.Now().Add(upstreamWriteTimeout))
-		if _, err := upConn.Write(data); err != nil {
-			upConn.SetWriteDeadline(time.Time{})
-			log.Printf("[central] conn=%d: flush failed: %v", connID, err)
-			upConn.Close()
-			cs.removeConn(connID)
-			return
+		select {
+		case writeCh <- data:
+		default:
 		}
 	}
-	upConn.SetWriteDeadline(time.Time{})
 
 	log.Printf("[central] conn=%d: upstream connected to %s", connID, targetAddr)
 
@@ -511,6 +518,45 @@ func (cs *centralServer) relayUpstreamToTunnel(ctx context.Context, connID uint3
 				log.Printf("[central] conn=%d: upstream read error: %v", connID, err)
 			}
 			return
+		}
+	}
+}
+
+// upstreamWriter is a dedicated goroutine that drains writeCh and writes
+// to the upstream (Xray) connection. This decouples upstream write speed
+// from frame dispatch speed — handleData never blocks the frame loop.
+func (cs *centralServer) upstreamWriter(ctx context.Context, connID uint32, upstream net.Conn, writeCh chan []byte) {
+	for {
+		select {
+		case <-ctx.Done():
+			// Context cancelled (removeConn or cleanup) — drain any remaining data best-effort
+			for {
+				select {
+				case data := <-writeCh:
+					upstream.SetWriteDeadline(time.Now().Add(2 * time.Second))
+					upstream.Write(data)
+				default:
+					return
+				}
+			}
+		case data, ok := <-writeCh:
+			if !ok {
+				return
+			}
+			upstream.SetWriteDeadline(time.Now().Add(upstreamWriteTimeout))
+			if _, err := upstream.Write(data); err != nil {
+				log.Printf("[central] conn=%d: upstream write failed: %v", connID, err)
+				upstream.SetWriteDeadline(time.Time{})
+				// Drain channel to unblock any senders, then exit
+				for {
+					select {
+					case <-writeCh:
+					default:
+						return
+					}
+				}
+			}
+			upstream.SetWriteDeadline(time.Time{})
 		}
 	}
 }
@@ -573,7 +619,7 @@ func (cs *centralServer) handleData(frame *tunnel.Frame, source *sourceConn) {
 		return
 	}
 
-	// Insert frame and collect ready data under lock (fast)
+	// Insert frame and collect ready data under lock (fast, no I/O)
 	state.mu.Lock()
 
 	// If this source isn't known yet (e.g., after tunnel recycling), add it.
@@ -591,12 +637,14 @@ func (cs *centralServer) handleData(frame *tunnel.Frame, source *sourceConn) {
 	state.lastActive = time.Now()
 	state.reorderer.Insert(frame.SeqNum, frame.Payload)
 
-	if state.target == nil {
+	// If upstream not connected yet, data stays in reorderer for later flush
+	writeCh := state.writeCh
+	if writeCh == nil {
 		state.mu.Unlock()
-		return // buffered, flushed when upstream connects
+		return
 	}
 
-	// Drain all ready data into a local slice, then release the lock
+	// Drain all ready data from reorderer
 	var chunks [][]byte
 	for {
 		data := state.reorderer.Next()
@@ -605,19 +653,16 @@ func (cs *centralServer) handleData(frame *tunnel.Frame, source *sourceConn) {
 		}
 		chunks = append(chunks, data)
 	}
-	target := state.target
 	state.mu.Unlock()
 
-	// Write to upstream OUTSIDE state.mu — prevents blocking frame dispatch
+	// Send to async writer (non-blocking — MUST NOT stall the frame dispatch loop)
 	for _, data := range chunks {
-		target.SetWriteDeadline(time.Now().Add(upstreamWriteTimeout))
-		if _, err := target.Write(data); err != nil {
-			target.SetWriteDeadline(time.Time{})
-			log.Printf("[central] conn=%d: write to upstream failed: %v", frame.ConnID, err)
-			return
+		select {
+		case writeCh <- data:
+		default:
+			log.Printf("[central] conn=%d: write queue full, dropping %d bytes", frame.ConnID, len(data))
 		}
 	}
-	target.SetWriteDeadline(time.Time{})
 }
 
 func (cs *centralServer) handleFIN(frame *tunnel.Frame) {
@@ -628,10 +673,11 @@ func (cs *centralServer) handleFIN(frame *tunnel.Frame) {
 		return
 	}
 
-	// Drain remaining data and grab target under lock, then close outside
+	// Drain remaining data and send to async writer (non-blocking)
 	state.mu.Lock()
 	var chunks [][]byte
-	if state.target != nil {
+	writeCh := state.writeCh
+	if writeCh != nil {
 		for {
 			data := state.reorderer.Next()
 			if data == nil {
@@ -640,17 +686,20 @@ func (cs *centralServer) handleFIN(frame *tunnel.Frame) {
 			chunks = append(chunks, data)
 		}
 	}
-	target := state.target
+	state.writeCh = nil // prevent further sends from handleData
 	state.mu.Unlock()
 
-	// Write and close outside the lock
-	if target != nil {
+	// Send remaining data to writer (non-blocking, best-effort)
+	if writeCh != nil {
 		for _, data := range chunks {
-			target.Write(data)
+			select {
+			case writeCh <- data:
+			default:
+			}
 		}
-		target.Close()
 	}
 
+	// removeConn cancels ctx → upstreamWriter exits → upstream closed by relayUpstreamToTunnel
 	cs.removeConn(frame.ConnID)
 	log.Printf("[central] conn=%d: FIN received, cleaned up", frame.ConnID)
 }
@@ -696,7 +745,7 @@ func (cs *centralServer) cleanupLoop() {
 		for id, state := range cs.conns {
 			state.mu.Lock()
 			shouldClean := false
-			//cc
+
 			// No upstream established after 60 seconds = stuck
 			if state.target == nil && now.Sub(state.created) > 60*time.Second {
 				shouldClean = true
