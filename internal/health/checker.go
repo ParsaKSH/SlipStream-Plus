@@ -25,12 +25,18 @@ import (
 // Latency is only set from successful tunnel probes (real RTT).
 const maxConsecutiveFailures = 3
 
+// tunnelHealthChecker is implemented by TunnelPool to report active tunnels.
+type tunnelHealthChecker interface {
+	HasActiveTunnel(instID int) bool
+}
+
 type Checker struct {
 	manager     *engine.Manager
 	interval    time.Duration
 	timeout     time.Duration
 	target      string // health_check.target (e.g. "google.com")
 	packetSplit bool   // true when strategy=packet_split
+	tunnelPool  tunnelHealthChecker // set in packet_split mode
 	ctx         context.Context
 	cancel      context.CancelFunc
 
@@ -73,6 +79,14 @@ func (c *Checker) Start() {
 // Must be called before Start().
 func (c *Checker) SetPacketSplit(enabled bool) {
 	c.packetSplit = enabled
+}
+
+// SetTunnelPool provides the TunnelPool so the health checker can skip
+// creating separate TCP connections when the TunnelPool already has an
+// active connection to an instance. This prevents interference with the
+// persistent tunnel connections used in packet_split mode.
+func (c *Checker) SetTunnelPool(pool tunnelHealthChecker) {
+	c.tunnelPool = pool
 }
 
 func (c *Checker) Stop() {
@@ -176,13 +190,22 @@ func (c *Checker) checkOne(inst *engine.Instance) {
 	}
 
 	// Step 3: End-to-end probe.
-	// In packet_split mode: test if instance's upstream speaks our framing protocol.
+	// In packet_split mode: if TunnelPool has an active connection, skip the
+	// separate framing probe entirely — the TunnelPool's keepalive + stale
+	// detection provides continuous health monitoring. Opening a separate TCP
+	// connection can interfere with the DNS tunnel's persistent connection.
+	// Only fall back to probeFramingProtocol for initial validation (before
+	// TunnelPool has connected).
 	// In normal mode: full SOCKS5 CONNECT + HTTP through the tunnel.
 	if c.target != "" && inst.Config.Mode != "ssh" {
 		var e2eRtt time.Duration
 		var e2eErr error
 
-		if c.packetSplit {
+		if c.packetSplit && c.tunnelPool != nil && c.tunnelPool.HasActiveTunnel(inst.ID()) {
+			// TunnelPool is connected — tunnel is working, skip separate probe
+			e2eRtt = rtt
+		} else if c.packetSplit {
+			// TunnelPool not yet connected — need separate probe for initial health check
 			e2eRtt, e2eErr = c.probeFramingProtocol(inst)
 		} else {
 			e2eRtt, e2eErr = c.probeEndToEnd(inst)
