@@ -25,10 +25,16 @@ type sourceConn struct {
 	writeMu sync.Mutex
 }
 
+// writeTimeout prevents tunnel writes from blocking forever on congested TCP.
+const sourceWriteTimeout = 10 * time.Second
+
 func (sc *sourceConn) WriteFrame(f *tunnel.Frame) error {
 	sc.writeMu.Lock()
 	defer sc.writeMu.Unlock()
-	return tunnel.WriteFrame(sc.conn, f)
+	sc.conn.SetWriteDeadline(time.Now().Add(sourceWriteTimeout))
+	err := tunnel.WriteFrame(sc.conn, f)
+	sc.conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
 // connState tracks a single reassembled connection.
@@ -431,21 +437,29 @@ func (cs *centralServer) connectUpstream(ctx context.Context, connID uint32, sta
 	state.mu.Lock()
 	state.target = upConn
 
-	// Flush any data that arrived before upstream was ready
+	// Drain buffered data under lock, then write outside
+	var flushChunks [][]byte
 	for {
 		data := state.reorderer.Next()
 		if data == nil {
 			break
 		}
+		flushChunks = append(flushChunks, data)
+	}
+	state.mu.Unlock()
+
+	// Flush outside lock
+	for _, data := range flushChunks {
+		upConn.SetWriteDeadline(time.Now().Add(upstreamWriteTimeout))
 		if _, err := upConn.Write(data); err != nil {
-			state.mu.Unlock()
+			upConn.SetWriteDeadline(time.Time{})
 			log.Printf("[central] conn=%d: flush failed: %v", connID, err)
 			upConn.Close()
 			cs.removeConn(connID)
 			return
 		}
 	}
-	state.mu.Unlock()
+	upConn.SetWriteDeadline(time.Time{})
 
 	log.Printf("[central] conn=%d: upstream connected to %s", connID, targetAddr)
 
@@ -502,8 +516,9 @@ func (cs *centralServer) relayUpstreamToTunnel(ctx context.Context, connID uint3
 }
 
 // sendFrame picks ONE source via round-robin and writes the frame.
-// If that source fails, tries the next one. Uses sourceConn.WriteFrame
-// which is mutex-protected per TCP connection, preventing interleaved writes.
+// CRITICAL: state.mu is only held briefly to pick the source and advance
+// the index — the actual TCP write happens OUTSIDE the lock to prevent
+// cascading lock contention that freezes frame dispatch for other ConnIDs.
 func (cs *centralServer) sendFrame(connID uint32, frame *tunnel.Frame) {
 	cs.mu.RLock()
 	state, ok := cs.conns[connID]
@@ -512,31 +527,43 @@ func (cs *centralServer) sendFrame(connID uint32, frame *tunnel.Frame) {
 		return
 	}
 
+	// Snapshot sources under lock, then write outside lock
 	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	if len(state.sources) == 0 {
+	n := len(state.sources)
+	if n == 0 {
+		state.mu.Unlock()
 		return
 	}
+	// Build ordered list starting from current sourceIdx
+	sources := make([]*sourceConn, n)
+	startIdx := state.sourceIdx % n
+	state.sourceIdx++
+	for i := 0; i < n; i++ {
+		sources[i] = state.sources[(startIdx+i)%n]
+	}
+	state.mu.Unlock()
 
-	// Try each source once, starting from current index
-	for tries := 0; tries < len(state.sources); tries++ {
-		idx := state.sourceIdx % len(state.sources)
-		state.sourceIdx++
-		sc := state.sources[idx]
-
+	// Try each source — write happens outside state.mu
+	for _, sc := range sources {
 		if err := sc.WriteFrame(frame); err != nil {
-			// Remove dead source
-			state.sources = append(state.sources[:idx], state.sources[idx+1:]...)
-			if state.sourceIdx > 0 {
-				state.sourceIdx--
+			// Remove dead source under lock
+			state.mu.Lock()
+			for i, s := range state.sources {
+				if s == sc {
+					state.sources = append(state.sources[:i], state.sources[i+1:]...)
+					break
+				}
 			}
+			state.mu.Unlock()
 			continue
 		}
 		return // success
 	}
 	log.Printf("[central] conn=%d: all sources failed", connID)
 }
+
+// upstreamWriteTimeout prevents writes to Xray upstream from blocking forever.
+const upstreamWriteTimeout = 10 * time.Second
 
 func (cs *centralServer) handleData(frame *tunnel.Frame, source *sourceConn) {
 	cs.mu.RLock()
@@ -546,11 +573,10 @@ func (cs *centralServer) handleData(frame *tunnel.Frame, source *sourceConn) {
 		return
 	}
 
+	// Insert frame and collect ready data under lock (fast)
 	state.mu.Lock()
-	defer state.mu.Unlock()
 
 	// If this source isn't known yet (e.g., after tunnel recycling), add it.
-	// This ensures responses can flow back through the new connection.
 	found := false
 	for _, s := range state.sources {
 		if s == source {
@@ -564,20 +590,34 @@ func (cs *centralServer) handleData(frame *tunnel.Frame, source *sourceConn) {
 
 	state.lastActive = time.Now()
 	state.reorderer.Insert(frame.SeqNum, frame.Payload)
+
 	if state.target == nil {
+		state.mu.Unlock()
 		return // buffered, flushed when upstream connects
 	}
 
+	// Drain all ready data into a local slice, then release the lock
+	var chunks [][]byte
 	for {
 		data := state.reorderer.Next()
 		if data == nil {
 			break
 		}
-		if _, err := state.target.Write(data); err != nil {
+		chunks = append(chunks, data)
+	}
+	target := state.target
+	state.mu.Unlock()
+
+	// Write to upstream OUTSIDE state.mu — prevents blocking frame dispatch
+	for _, data := range chunks {
+		target.SetWriteDeadline(time.Now().Add(upstreamWriteTimeout))
+		if _, err := target.Write(data); err != nil {
+			target.SetWriteDeadline(time.Time{})
 			log.Printf("[central] conn=%d: write to upstream failed: %v", frame.ConnID, err)
 			return
 		}
 	}
+	target.SetWriteDeadline(time.Time{})
 }
 
 func (cs *centralServer) handleFIN(frame *tunnel.Frame) {
@@ -587,20 +627,30 @@ func (cs *centralServer) handleFIN(frame *tunnel.Frame) {
 	if !ok {
 		return
 	}
+
+	// Drain remaining data and grab target under lock, then close outside
 	state.mu.Lock()
+	var chunks [][]byte
 	if state.target != nil {
 		for {
 			data := state.reorderer.Next()
 			if data == nil {
 				break
 			}
-			state.target.Write(data)
+			chunks = append(chunks, data)
 		}
-		state.target.Close()
 	}
+	target := state.target
 	state.mu.Unlock()
 
-	// Remove from map and cancel context so relayUpstreamToTunnel exits cleanly
+	// Write and close outside the lock
+	if target != nil {
+		for _, data := range chunks {
+			target.Write(data)
+		}
+		target.Close()
+	}
+
 	cs.removeConn(frame.ConnID)
 	log.Printf("[central] conn=%d: FIN received, cleaned up", frame.ConnID)
 }
