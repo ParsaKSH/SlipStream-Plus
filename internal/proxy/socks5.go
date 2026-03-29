@@ -237,6 +237,12 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 
 // handlePacketSplit handles a connection using packet-level load balancing.
 func (s *Server) handlePacketSplit(clientConn net.Conn, connID uint64, atyp byte, addrBytes, portBytes []byte, user *users.User) {
+	// Fast-fail if no tunnels are connected yet (e.g., right after restart)
+	if !s.tunnelPool.HasTunnels() {
+		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
 	healthy := s.manager.HealthyInstances()
 	socksHealthy := make([]*engine.Instance, 0, len(healthy))
 	for _, inst := range healthy {
@@ -249,15 +255,12 @@ func (s *Server) handlePacketSplit(clientConn net.Conn, connID uint64, atyp byte
 		return
 	}
 
-	// Track connections on all used instances
-	for _, inst := range socksHealthy {
-		inst.IncrConns()
-	}
-	defer func() {
-		for _, inst := range socksHealthy {
-			inst.DecrConns()
-		}
-	}()
+	// Track connection count on ONE instance only (first healthy one).
+	// In packet_split, the single user connection is multiplexed across all
+	// instances, so incrementing all of them inflates the count by N×.
+	trackInst := socksHealthy[0]
+	trackInst.IncrConns()
+	defer trackInst.DecrConns()
 
 	// Create a packet splitter for this connection
 	tunnelConnID := s.connIDGen.Next()

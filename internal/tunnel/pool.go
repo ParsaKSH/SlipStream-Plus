@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -41,6 +42,8 @@ type TunnelPool struct {
 	handlers sync.Map // ConnID (uint32) → chan *Frame
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
+	ready    chan struct{} // closed when at least one tunnel is connected
+	readyOnce sync.Once
 }
 
 func NewTunnelPool(mgr *engine.Manager) *TunnelPool {
@@ -48,7 +51,26 @@ func NewTunnelPool(mgr *engine.Manager) *TunnelPool {
 		mgr:     mgr,
 		tunnels: make(map[int]*TunnelConn),
 		stopCh:  make(chan struct{}),
+		ready:   make(chan struct{}),
 	}
+}
+
+// WaitReady blocks until at least one tunnel is connected, or ctx is cancelled.
+func (p *TunnelPool) WaitReady(ctx context.Context) bool {
+	select {
+	case <-p.ready:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// HasTunnels returns true if at least one tunnel is currently connected.
+func (p *TunnelPool) HasTunnels() bool {
+	p.mu.RLock()
+	n := len(p.tunnels)
+	p.mu.RUnlock()
+	return n > 0
 }
 
 func (p *TunnelPool) Start() {
@@ -162,6 +184,14 @@ func (p *TunnelPool) refreshConnections() {
 		log.Printf("[tunnel-pool] connected to instance %d (%s:%d)",
 			inst.ID(), inst.Config.Domain, inst.Config.Port)
 	}
+
+	// Signal readiness once we have at least one tunnel
+	if len(p.tunnels) > 0 {
+		p.readyOnce.Do(func() {
+			close(p.ready)
+			log.Printf("[tunnel-pool] ready (%d tunnels connected)", len(p.tunnels))
+		})
+	}
 }
 
 func (p *TunnelPool) connectInstance(inst *engine.Instance) (*TunnelConn, error) {
@@ -230,12 +260,12 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 			ch := v.(chan *Frame)
 			select {
 			case ch <- frame:
-			case <-time.After(5 * time.Second):
-				// Buffer full for too long — connection is stuck, log and drop
-				log.Printf("[tunnel-pool] instance %d: frame buffer full for conn=%d, dropping frame seq=%d",
+			default:
+				// Drop immediately — MUST NOT block readLoop because it serves
+				// ALL ConnIDs on this tunnel. Blocking here stalls every other
+				// connection sharing this tunnel.
+				log.Printf("[tunnel-pool] instance %d: dropping frame conn=%d seq=%d (buffer full)",
 					tc.inst.ID(), frame.ConnID, frame.SeqNum)
-			case <-p.stopCh:
-				return
 			}
 		}
 	}

@@ -121,14 +121,45 @@ func (ps *PacketSplitter) RelayUpstreamToClient(ctx context.Context, client io.W
 	reorderer := NewReorderer()
 	var totalBytes int64
 
+	// Periodic ticker to:
+	// 1. Drive gap-skip timeouts even when no new frames arrive
+	// 2. Detect idle connections (no data for idleLimit → give up)
+	gapTicker := time.NewTicker(500 * time.Millisecond)
+	defer gapTicker.Stop()
+
+	const idleLimit = 30 * time.Second
+	lastActivity := time.Now()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return totalBytes
+
+		case <-gapTicker.C:
+			// Periodically drive gap-skip even without new frames
+			for {
+				data := reorderer.Next()
+				if data == nil {
+					break
+				}
+				n, err := client.Write(data)
+				totalBytes += int64(n)
+				lastActivity = time.Now()
+				if err != nil {
+					return totalBytes
+				}
+			}
+			// Idle timeout: if nothing happened for too long, give up
+			if time.Since(lastActivity) > idleLimit {
+				return totalBytes
+			}
+
 		case frame, ok := <-ps.incoming:
 			if !ok {
 				return totalBytes
 			}
+
+			lastActivity = time.Now()
 
 			if frame.IsFIN() || frame.IsRST() {
 				for {
