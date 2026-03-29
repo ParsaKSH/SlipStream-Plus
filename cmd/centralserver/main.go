@@ -39,12 +39,12 @@ func (sc *sourceConn) WriteFrame(f *tunnel.Frame) error {
 
 // connState tracks a single reassembled connection.
 type connState struct {
-	mu        sync.Mutex
-	target    net.Conn // connection to the SOCKS upstream
-	reorderer *tunnel.Reorderer
-	txSeq     uint32 // next sequence number for reverse data
-	cancel    context.CancelFunc
-	created   time.Time
+	mu         sync.Mutex
+	target     net.Conn // connection to the SOCKS upstream
+	reorderer  *tunnel.Reorderer
+	txSeq      uint32 // next sequence number for reverse data
+	cancel     context.CancelFunc
+	created    time.Time
 	lastActive time.Time // last time data was sent or received
 
 	// Sources: all tunnel connections that can carry reverse data.
@@ -61,7 +61,7 @@ type centralServer struct {
 	conns map[uint32]*connState // ConnID → state
 
 	// sourceMu protects the sources map (net.Conn → *sourceConn).
-	sourceMu sync.Mutex
+	sourceMu  sync.Mutex
 	sourceMap map[net.Conn]*sourceConn
 }
 
@@ -696,7 +696,7 @@ func (cs *centralServer) cleanupLoop() {
 		for id, state := range cs.conns {
 			state.mu.Lock()
 			shouldClean := false
-
+			//cc
 			// No upstream established after 60 seconds = stuck
 			if state.target == nil && now.Sub(state.created) > 60*time.Second {
 				shouldClean = true
