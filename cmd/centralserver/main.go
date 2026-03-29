@@ -311,6 +311,10 @@ func (cs *centralServer) parseHeader(hdr [tunnel.HeaderSize]byte, conn net.Conn,
 }
 
 func (cs *centralServer) dispatchFrame(frame *tunnel.Frame, source *sourceConn) {
+	// ConnID 0 is a keepalive from TunnelPool — ignore silently
+	if frame.ConnID == 0 {
+		return
+	}
 	if frame.IsSYN() {
 		cs.handleSYN(frame, source)
 		return

@@ -20,15 +20,23 @@ const writeTimeout = 10 * time.Second
 // staleThreshold: if we've sent data but haven't received anything
 // in this long, the connection is considered half-dead and will be
 // force-closed by refreshConnections (which triggers reconnect).
-const staleThreshold = 20 * time.Second
+const staleThreshold = 15 * time.Second
+
+// maxTunnelAge: force-reconnect tunnels older than this, even if they
+// appear healthy. Prevents long-lived connection degradation in DNS tunnels.
+const maxTunnelAge = 3 * time.Minute
+
+// keepaliveInterval: how often to send keepalive frames to detect dead tunnels.
+const keepaliveInterval = 10 * time.Second
 
 // TunnelConn wraps a persistent TCP connection to a single instance.
 type TunnelConn struct {
-	inst    *engine.Instance
-	mu      sync.Mutex
-	conn    net.Conn
-	writeMu sync.Mutex
-	closed  bool
+	inst      *engine.Instance
+	mu        sync.Mutex
+	conn      net.Conn
+	writeMu   sync.Mutex
+	closed    bool
+	createdAt time.Time
 
 	lastRead  atomic.Int64 // unix millis of last successful read
 	lastWrite atomic.Int64 // unix millis of last successful write
@@ -36,13 +44,13 @@ type TunnelConn struct {
 
 // TunnelPool manages ONE persistent connection per healthy instance.
 type TunnelPool struct {
-	mgr      *engine.Manager
-	mu       sync.RWMutex
-	tunnels  map[int]*TunnelConn
-	handlers sync.Map // ConnID (uint32) → chan *Frame
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	ready    chan struct{} // closed when at least one tunnel is connected
+	mgr       *engine.Manager
+	mu        sync.RWMutex
+	tunnels   map[int]*TunnelConn
+	handlers  sync.Map // ConnID (uint32) → chan *Frame
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
+	ready     chan struct{} // closed when at least one tunnel is connected
 	readyOnce sync.Once
 }
 
@@ -73,25 +81,38 @@ func (p *TunnelPool) HasTunnels() bool {
 	return n > 0
 }
 
+// HasActiveTunnel returns true if the given instance has a non-closed tunnel.
+func (p *TunnelPool) HasActiveTunnel(instID int) bool {
+	p.mu.RLock()
+	tc, ok := p.tunnels[instID]
+	p.mu.RUnlock()
+	return ok && !tc.closed
+}
+
 func (p *TunnelPool) Start() {
 	p.refreshConnections()
 
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
+		refreshTicker := time.NewTicker(5 * time.Second)
+		keepaliveTicker := time.NewTicker(keepaliveInterval)
+		defer refreshTicker.Stop()
+		defer keepaliveTicker.Stop()
 		for {
 			select {
 			case <-p.stopCh:
 				return
-			case <-ticker.C:
+			case <-refreshTicker.C:
 				p.refreshConnections()
+			case <-keepaliveTicker.C:
+				p.sendKeepalives()
 			}
 		}
 	}()
 
-	log.Printf("[tunnel-pool] started (stale_threshold=%s)", staleThreshold)
+	log.Printf("[tunnel-pool] started (stale_threshold=%s, max_age=%s, keepalive=%s)",
+		staleThreshold, maxTunnelAge, keepaliveInterval)
 }
 
 func (p *TunnelPool) Stop() {
@@ -131,10 +152,37 @@ func (p *TunnelPool) SendFrame(instID int, f *Frame) error {
 	return tc.writeFrame(f)
 }
 
-// refreshConnections reconnects dead/stale tunnels and adds new ones.
+// sendKeepalives writes a small keepalive frame through each tunnel.
+// This detects dead tunnels faster than waiting for stale detection,
+// and keeps DNS tunnel sessions alive.
+func (p *TunnelPool) sendKeepalives() {
+	p.mu.RLock()
+	tunnels := make([]*TunnelConn, 0, len(p.tunnels))
+	for _, tc := range p.tunnels {
+		tunnels = append(tunnels, tc)
+	}
+	p.mu.RUnlock()
+
+	keepalive := &Frame{
+		ConnID:  0, // reserved — CentralServer ignores ConnID 0
+		SeqNum:  0,
+		Flags:   FlagData,
+		Payload: nil,
+	}
+
+	for _, tc := range tunnels {
+		if err := tc.writeFrame(keepalive); err != nil {
+			log.Printf("[tunnel-pool] instance %d: keepalive failed: %v", tc.inst.ID(), err)
+			tc.close()
+		}
+	}
+}
+
+// refreshConnections reconnects dead/stale/old tunnels and adds new ones.
 func (p *TunnelPool) refreshConnections() {
 	healthy := p.mgr.HealthyInstances()
-	nowMs := time.Now().UnixMilli()
+	now := time.Now()
+	nowMs := now.UnixMilli()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -146,24 +194,30 @@ func (p *TunnelPool) refreshConnections() {
 
 	for id, tc := range p.tunnels {
 		shouldRemove := false
+		reason := ""
 
-		if !activeIDs[id] || tc.closed {
+		if !activeIDs[id] {
 			shouldRemove = true
+			reason = "instance unhealthy"
+		} else if tc.closed {
+			shouldRemove = true
+			reason = "connection closed"
+		} else if now.Sub(tc.createdAt) > maxTunnelAge {
+			// Force-reconnect old connections to prevent DNS tunnel degradation
+			shouldRemove = true
+			reason = fmt.Sprintf("max age exceeded (%s)", now.Sub(tc.createdAt).Round(time.Second))
 		} else {
-			// Detect half-dead connections:
-			// If we wrote recently but haven't read in staleThreshold,
-			// the QUIC tunnel is likely dead but local TCP is still open.
-			// Force-close it so readLoop exits and we can reconnect.
+			// Detect half-dead connections
 			lastW := tc.lastWrite.Load()
 			lastR := tc.lastRead.Load()
 			if lastW > 0 && (nowMs-lastR) > staleThreshold.Milliseconds() {
-				log.Printf("[tunnel-pool] instance %d: stale (last_read=%dms ago, last_write=%dms ago), force-closing",
-					id, nowMs-lastR, nowMs-lastW)
 				shouldRemove = true
+				reason = fmt.Sprintf("stale (last_read=%dms ago, last_write=%dms ago)", nowMs-lastR, nowMs-lastW)
 			}
 		}
 
 		if shouldRemove {
+			log.Printf("[tunnel-pool] instance %d: removing (%s)", id, reason)
 			tc.close()
 			delete(p.tunnels, id)
 		}
@@ -206,12 +260,13 @@ func (p *TunnelPool) connectInstance(inst *engine.Instance) (*TunnelConn, error)
 		tc.SetNoDelay(true)
 	}
 
-	now := time.Now().UnixMilli()
+	now := time.Now()
 	tunnel := &TunnelConn{
-		inst: inst,
-		conn: conn,
+		inst:      inst,
+		conn:      conn,
+		createdAt: now,
 	}
-	tunnel.lastRead.Store(now)
+	tunnel.lastRead.Store(now.UnixMilli())
 	tunnel.lastWrite.Store(0)
 
 	p.wg.Add(1)
@@ -236,9 +291,6 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 		default:
 		}
 
-		// NO read deadline here! ReadFrame blocks until a complete frame
-		// arrives or the connection closes. read deadline would cause
-		// partial header reads → stream corruption.
 		frame, err := ReadFrame(tc.conn)
 		if err != nil {
 			if err != io.EOF && !isClosedErr(err) {
@@ -250,10 +302,9 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 
 		tc.lastRead.Store(time.Now().UnixMilli())
 
-		// Diagnostic: log reverse frames (data coming back from instances)
-		if frame.IsReverse() || frame.IsFIN() || frame.IsRST() {
-			log.Printf("[tunnel-pool] instance %d: recv frame conn=%d seq=%d flags=0x%02x len=%d",
-				tc.inst.ID(), frame.ConnID, frame.SeqNum, frame.Flags, len(frame.Payload))
+		// Skip keepalive responses (ConnID 0)
+		if frame.ConnID == 0 {
+			continue
 		}
 
 		if v, ok := p.handlers.Load(frame.ConnID); ok {
@@ -261,11 +312,8 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 			select {
 			case ch <- frame:
 			default:
-				// Drop immediately — MUST NOT block readLoop because it serves
-				// ALL ConnIDs on this tunnel. Blocking here stalls every other
-				// connection sharing this tunnel.
-				log.Printf("[tunnel-pool] instance %d: dropping frame conn=%d seq=%d (buffer full)",
-					tc.inst.ID(), frame.ConnID, frame.SeqNum)
+				log.Printf("[tunnel-pool] instance %d: dropping frame conn=%d (buffer full)",
+					tc.inst.ID(), frame.ConnID)
 			}
 		}
 	}
