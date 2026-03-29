@@ -99,9 +99,6 @@ func main() {
 	if isPacketSplit {
 		tunnelPool = tunnel.NewTunnelPool(mgr)
 		tunnelPool.Start()
-		// Tell health checker to use TunnelPool for probes instead of
-		// creating separate TCP connections that interfere with the tunnel.
-		checker.SetTunnelPool(tunnelPool)
 		log.Printf("Packet-split mode: central_server=%s, chunk_size=%d",
 			cfg.CentralServer.Address, cfg.CentralServer.ChunkSize)
 	}
