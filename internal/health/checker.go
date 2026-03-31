@@ -20,14 +20,10 @@ import (
 // An instance is HEALTHY only after a successful tunnel probe (SOCKS5/SSH).
 // An instance is UNHEALTHY if:
 //   - TCP connect to local port fails (process dead)
-//   - Tunnel probe fails N consecutive times (tunnel broken)
+//   - Tunnel probe fails 3 consecutive times (tunnel broken)
 //
 // Latency is only set from successful tunnel probes (real RTT).
 const maxConsecutiveFailures = 3
-
-// In packet_split mode, a single unhealthy instance drops packets for ALL
-// connections, so we use a stricter threshold to remove bad instances faster.
-const maxConsecutiveFailuresPacketSplit = 1
 
 type Checker struct {
 	manager     *engine.Manager
@@ -63,13 +59,6 @@ func NewChecker(mgr *engine.Manager, cfg *config.HealthCheckConfig) *Checker {
 	}
 }
 
-func (c *Checker) maxFailures() int {
-	if c.packetSplit {
-		return maxConsecutiveFailuresPacketSplit
-	}
-	return maxConsecutiveFailures
-}
-
 func (c *Checker) Start() {
 	go c.run()
 	mode := "connection"
@@ -77,7 +66,7 @@ func (c *Checker) Start() {
 		mode = "packet-split"
 	}
 	log.Printf("[health] checker started (interval=%s, tunnel_timeout=%s, target=%s, mode=%s, unhealthy_after=%d failures)",
-		c.interval, c.timeout, c.target, mode, c.maxFailures())
+		c.interval, c.timeout, c.target, mode, maxConsecutiveFailures)
 }
 
 // SetPacketSplit enables framing protocol health checks.
@@ -167,8 +156,7 @@ func (c *Checker) checkOne(inst *engine.Instance) {
 
 	if err != nil {
 		failCount := c.recordFailure(inst.ID())
-		maxFail := c.maxFailures()
-		if failCount >= maxFail {
+		if failCount >= maxConsecutiveFailures {
 			if inst.State() != engine.StateUnhealthy {
 				log.Printf("[health] instance %d (%s:%d) UNHEALTHY after %d tunnel failures: %v",
 					inst.ID(), inst.Config.Domain, inst.Config.Port, failCount, err)
@@ -182,7 +170,7 @@ func (c *Checker) checkOne(inst *engine.Instance) {
 		} else {
 			log.Printf("[health] instance %d (%s:%d) tunnel probe failed (%d/%d): %v",
 				inst.ID(), inst.Config.Domain, inst.Config.Port,
-				failCount, maxFail, err)
+				failCount, maxConsecutiveFailures, err)
 		}
 		return
 	}
@@ -202,26 +190,17 @@ func (c *Checker) checkOne(inst *engine.Instance) {
 
 		if e2eErr != nil {
 			failCount := c.recordFailure(inst.ID())
-			maxFail := c.maxFailures()
-			if failCount >= maxFail {
+			if failCount >= maxConsecutiveFailures {
 				if inst.State() != engine.StateUnhealthy {
 					log.Printf("[health] instance %d (%s:%d) UNHEALTHY after %d e2e failures: %v",
 						inst.ID(), inst.Config.Domain, inst.Config.Port, failCount, e2eErr)
 					inst.SetState(engine.StateUnhealthy)
 					inst.SetLastPingMs(-1)
-					// In packet_split mode, auto-restart on e2e failure too —
-					// a broken upstream path drops packets for ALL connections.
-					if c.packetSplit {
-						go func() {
-							log.Printf("[health] auto-restarting instance %d (e2e failure in packet_split)", inst.ID())
-							c.manager.RestartInstance(inst.ID())
-						}()
-					}
 				}
 			} else {
 				log.Printf("[health] instance %d (%s:%d) e2e probe failed (%d/%d): %v",
 					inst.ID(), inst.Config.Domain, inst.Config.Port,
-					failCount, maxFail, e2eErr)
+					failCount, maxConsecutiveFailures, e2eErr)
 			}
 			return
 		}
