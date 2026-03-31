@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,52 +13,31 @@ import (
 	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 )
 
-// writeTimeout prevents writes from blocking forever on stalled connections.
-const writeTimeout = 10 * time.Second
+// ConnsPerInstance is the number of persistent connections to maintain
+// per healthy instance. When one dies, it's replaced on the next refresh.
+// Multiple connections provide redundancy — if one degrades, others serve traffic.
+const ConnsPerInstance = 8
 
-// staleThreshold: if we've sent data but haven't received anything
-// in this long, the connection is considered half-dead and will be
-// force-closed by refreshConnections (which triggers reconnect).
-const staleThreshold = 15 * time.Second
-
-// maxTunnelAge: force-reconnect tunnels older than this, even if they
-// appear healthy. Prevents long-lived connection degradation in DNS tunnels.
-const maxTunnelAge = 3 * time.Minute
-
-// keepaliveInterval: how often to send keepalive frames to detect dead tunnels.
-const keepaliveInterval = 10 * time.Second
-
-// TunnelConn wraps a persistent TCP connection to a single instance.
-type TunnelConn struct {
-	inst      *engine.Instance
-	mu        sync.Mutex
-	conn      net.Conn
-	writeMu   sync.Mutex
-	closed    bool
-	createdAt time.Time
-
-	lastRead  atomic.Int64 // unix millis of last successful read
-	lastWrite atomic.Int64 // unix millis of last successful write
-}
-
-// TunnelPool manages ONE persistent connection per healthy instance.
+// TunnelPool manages multiple persistent connections per healthy instance.
+// All connections serve the same handler map, providing redundancy.
 type TunnelPool struct {
-	mgr       *engine.Manager
-	mu        sync.RWMutex
-	tunnels   map[int]*TunnelConn
-	handlers  sync.Map // ConnID (uint32) → chan *Frame
-	stopCh    chan struct{}
-	wg        sync.WaitGroup
-	ready     chan struct{} // closed when at least one tunnel is connected
-	readyOnce sync.Once
+	mgr        *engine.Manager
+	mu         sync.RWMutex
+	conns      map[int][]*TunnelConn // instance ID → pool of connections
+	handlers   sync.Map              // ConnID (uint32) → chan *Frame
+	stopCh     chan struct{}
+	wg         sync.WaitGroup
+	ready      chan struct{}
+	readyOnce  sync.Once
+	roundRobin atomic.Uint64
 }
 
 func NewTunnelPool(mgr *engine.Manager) *TunnelPool {
 	return &TunnelPool{
-		mgr:     mgr,
-		tunnels: make(map[int]*TunnelConn),
-		stopCh:  make(chan struct{}),
-		ready:   make(chan struct{}),
+		mgr:    mgr,
+		conns:  make(map[int][]*TunnelConn),
+		stopCh: make(chan struct{}),
+		ready:  make(chan struct{}),
 	}
 }
 
@@ -76,17 +54,28 @@ func (p *TunnelPool) WaitReady(ctx context.Context) bool {
 // HasTunnels returns true if at least one tunnel is currently connected.
 func (p *TunnelPool) HasTunnels() bool {
 	p.mu.RLock()
-	n := len(p.tunnels)
-	p.mu.RUnlock()
-	return n > 0
+	defer p.mu.RUnlock()
+	for _, conns := range p.conns {
+		for _, tc := range conns {
+			if !tc.closed {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-// HasActiveTunnel returns true if the given instance has a non-closed tunnel.
+// HasActiveTunnel returns true if the given instance has at least one non-closed tunnel.
 func (p *TunnelPool) HasActiveTunnel(instID int) bool {
 	p.mu.RLock()
-	tc, ok := p.tunnels[instID]
+	conns := p.conns[instID]
 	p.mu.RUnlock()
-	return ok && !tc.closed
+	for _, tc := range conns {
+		if !tc.closed {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *TunnelPool) Start() {
@@ -95,33 +84,31 @@ func (p *TunnelPool) Start() {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		refreshTicker := time.NewTicker(5 * time.Second)
-		keepaliveTicker := time.NewTicker(keepaliveInterval)
-		defer refreshTicker.Stop()
-		defer keepaliveTicker.Stop()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-p.stopCh:
 				return
-			case <-refreshTicker.C:
+			case <-ticker.C:
 				p.refreshConnections()
-			case <-keepaliveTicker.C:
-				p.sendKeepalives()
 			}
 		}
 	}()
 
-	log.Printf("[tunnel-pool] started (stale_threshold=%s, max_age=%s, keepalive=%s)",
-		staleThreshold, maxTunnelAge, keepaliveInterval)
+	log.Printf("[tunnel-pool] started (conns_per_instance=%d, stale_threshold=%s)",
+		ConnsPerInstance, staleThreshold)
 }
 
 func (p *TunnelPool) Stop() {
 	close(p.stopCh)
 	p.mu.Lock()
-	for _, tc := range p.tunnels {
-		tc.close()
+	for _, conns := range p.conns {
+		for _, tc := range conns {
+			tc.close()
+		}
 	}
-	p.tunnels = make(map[int]*TunnelConn)
+	p.conns = make(map[int][]*TunnelConn)
 	p.mu.Unlock()
 	p.wg.Wait()
 	log.Printf("[tunnel-pool] stopped")
@@ -140,49 +127,39 @@ func (p *TunnelPool) UnregisterConn(connID uint32) {
 	}
 }
 
+// SendFrame sends a frame through one of the instance's pooled connections.
+// Uses round-robin with automatic failover to the next connection on error.
 func (p *TunnelPool) SendFrame(instID int, f *Frame) error {
 	p.mu.RLock()
-	tc, ok := p.tunnels[instID]
+	conns := p.conns[instID]
+	n := len(conns)
 	p.mu.RUnlock()
 
-	if !ok {
+	if n == 0 {
 		return fmt.Errorf("no tunnel for instance %d", instID)
 	}
 
-	return tc.writeFrame(f)
-}
-
-// sendKeepalives writes a small keepalive frame through each tunnel.
-// This detects dead tunnels faster than waiting for stale detection,
-// and keeps DNS tunnel sessions alive.
-func (p *TunnelPool) sendKeepalives() {
-	p.mu.RLock()
-	tunnels := make([]*TunnelConn, 0, len(p.tunnels))
-	for _, tc := range p.tunnels {
-		tunnels = append(tunnels, tc)
-	}
-	p.mu.RUnlock()
-
-	keepalive := &Frame{
-		ConnID:  0, // reserved — CentralServer ignores ConnID 0
-		SeqNum:  0,
-		Flags:   FlagData,
-		Payload: nil,
-	}
-
-	for _, tc := range tunnels {
-		if err := tc.writeFrame(keepalive); err != nil {
-			log.Printf("[tunnel-pool] instance %d: keepalive failed: %v", tc.inst.ID(), err)
-			tc.close()
+	// Round-robin with fallback: try each connection once
+	start := int(p.roundRobin.Add(1)) % n
+	for i := 0; i < n; i++ {
+		tc := conns[(start+i)%n]
+		if tc.closed {
+			continue
 		}
+		if err := tc.writeFrame(f); err != nil {
+			// Mark dead — will be cleaned up and replaced by refreshConnections
+			tc.close()
+			continue
+		}
+		return nil
 	}
+	return fmt.Errorf("all %d tunnels for instance %d failed", n, instID)
 }
 
-// refreshConnections reconnects dead/stale/old tunnels and adds new ones.
+// refreshConnections removes dead/stale connections and replenishes pools.
 func (p *TunnelPool) refreshConnections() {
 	healthy := p.mgr.HealthyInstances()
-	now := time.Now()
-	nowMs := now.UnixMilli()
+	nowMs := time.Now().UnixMilli()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -192,58 +169,82 @@ func (p *TunnelPool) refreshConnections() {
 		activeIDs[inst.ID()] = true
 	}
 
-	for id, tc := range p.tunnels {
-		shouldRemove := false
-		reason := ""
-
+	// Phase 1: Remove dead connections, clean up unhealthy instances
+	for id, conns := range p.conns {
 		if !activeIDs[id] {
-			shouldRemove = true
-			reason = "instance unhealthy"
-		} else if tc.closed {
-			shouldRemove = true
-			reason = "connection closed"
-		} else if now.Sub(tc.createdAt) > maxTunnelAge {
-			// Force-reconnect old connections to prevent DNS tunnel degradation
-			shouldRemove = true
-			reason = fmt.Sprintf("max age exceeded (%s)", now.Sub(tc.createdAt).Round(time.Second))
-		} else {
-			// Detect half-dead connections
-			lastW := tc.lastWrite.Load()
-			lastR := tc.lastRead.Load()
-			if lastW > 0 && (nowMs-lastR) > staleThreshold.Milliseconds() {
+			for _, tc := range conns {
+				tc.close()
+			}
+			delete(p.conns, id)
+			continue
+		}
+
+		// Filter out closed/stale connections (new slice to avoid sharing backing array)
+		var alive []*TunnelConn
+		for _, tc := range conns {
+			shouldRemove := false
+			if tc.closed {
 				shouldRemove = true
-				reason = fmt.Sprintf("stale (last_read=%dms ago, last_write=%dms ago)", nowMs-lastR, nowMs-lastW)
+			} else {
+				lastW := tc.lastWrite.Load()
+				lastR := tc.lastRead.Load()
+				if lastW > 0 && (nowMs-lastR) > staleThreshold.Milliseconds() {
+					log.Printf("[tunnel-pool] instance %d: stale conn (last_read=%dms ago), replacing",
+						id, nowMs-lastR)
+					shouldRemove = true
+				}
+			}
+
+			if shouldRemove {
+				tc.close()
+			} else {
+				alive = append(alive, tc)
 			}
 		}
 
-		if shouldRemove {
-			log.Printf("[tunnel-pool] instance %d: removing (%s)", id, reason)
-			tc.close()
-			delete(p.tunnels, id)
+		if len(alive) == 0 {
+			delete(p.conns, id)
+		} else {
+			p.conns[id] = alive
 		}
 	}
 
+	// Phase 2: Replenish — ensure each healthy instance has ConnsPerInstance connections
 	for _, inst := range healthy {
 		if inst.Config.Mode == "ssh" {
 			continue
 		}
-		if _, exists := p.tunnels[inst.ID()]; exists {
-			continue
+		id := inst.ID()
+		current := len(p.conns[id])
+		need := ConnsPerInstance - current
+
+		if need > 0 {
+			added := 0
+			for i := 0; i < need; i++ {
+				tc, err := p.connectInstance(inst)
+				if err != nil {
+					break // dial failed, stop trying this instance
+				}
+				p.conns[id] = append(p.conns[id], tc)
+				added++
+			}
+			if added > 0 {
+				log.Printf("[tunnel-pool] instance %d: +%d connections (now %d/%d)",
+					id, added, len(p.conns[id]), ConnsPerInstance)
+			}
 		}
-		tc, err := p.connectInstance(inst)
-		if err != nil {
-			continue
-		}
-		p.tunnels[inst.ID()] = tc
-		log.Printf("[tunnel-pool] connected to instance %d (%s:%d)",
-			inst.ID(), inst.Config.Domain, inst.Config.Port)
 	}
 
-	// Signal readiness once we have at least one tunnel
-	if len(p.tunnels) > 0 {
+	// Signal readiness
+	total := 0
+	for _, conns := range p.conns {
+		total += len(conns)
+	}
+	if total > 0 {
 		p.readyOnce.Do(func() {
 			close(p.ready)
-			log.Printf("[tunnel-pool] ready (%d tunnels connected)", len(p.tunnels))
+			log.Printf("[tunnel-pool] ready (%d total connections across %d instances)",
+				total, len(p.conns))
 		})
 	}
 }
@@ -261,21 +262,20 @@ func (p *TunnelPool) connectInstance(inst *engine.Instance) (*TunnelConn, error)
 	}
 
 	now := time.Now()
-	tunnel := &TunnelConn{
-		inst:      inst,
-		conn:      conn,
-		createdAt: now,
+	tc := &TunnelConn{
+		inst: inst,
+		conn: conn,
 	}
-	tunnel.lastRead.Store(now.UnixMilli())
-	tunnel.lastWrite.Store(0)
+	tc.lastRead.Store(now.UnixMilli())
+	tc.lastWrite.Store(0)
 
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		p.readLoop(tunnel)
+		p.readLoop(tc)
 	}()
 
-	return tunnel, nil
+	return tc, nil
 }
 
 // readLoop reads frames WITHOUT any read deadline.
@@ -283,6 +283,9 @@ func (p *TunnelPool) connectInstance(inst *engine.Instance) (*TunnelConn, error)
 // header reads corrupt the entire frame stream (all subsequent reads get
 // misaligned). The only way to stop readLoop is to close the connection
 // (via tc.close()), which makes ReadFrame return an error.
+//
+// Each connection in the pool has its own readLoop. All readLoops dispatch
+// to the same handlers map, so frames from any connection reach the right handler.
 func (p *TunnelPool) readLoop(tc *TunnelConn) {
 	for {
 		select {
@@ -294,7 +297,7 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 		frame, err := ReadFrame(tc.conn)
 		if err != nil {
 			if err != io.EOF && !isClosedErr(err) {
-				log.Printf("[tunnel-pool] instance %d read error: %v", tc.inst.ID(), err)
+				log.Printf("[tunnel-pool] instance %d: read error: %v", tc.inst.ID(), err)
 			}
 			tc.close()
 			return
@@ -302,7 +305,7 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 
 		tc.lastRead.Store(time.Now().UnixMilli())
 
-		// Skip keepalive responses (ConnID 0)
+		// ConnID 0 is reserved (keepalive) — skip
 		if frame.ConnID == 0 {
 			continue
 		}
@@ -317,39 +320,4 @@ func (p *TunnelPool) readLoop(tc *TunnelConn) {
 			}
 		}
 	}
-}
-
-func (tc *TunnelConn) writeFrame(f *Frame) error {
-	tc.writeMu.Lock()
-	defer tc.writeMu.Unlock()
-
-	if tc.closed {
-		return fmt.Errorf("tunnel closed")
-	}
-
-	tc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	err := WriteFrame(tc.conn, f)
-	tc.conn.SetWriteDeadline(time.Time{})
-
-	if err == nil {
-		tc.lastWrite.Store(time.Now().UnixMilli())
-	}
-	return err
-}
-
-func (tc *TunnelConn) close() {
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	if !tc.closed {
-		tc.closed = true
-		tc.conn.Close()
-	}
-}
-
-func isClosedErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "use of closed network connection") ||
-		strings.Contains(err.Error(), "connection reset by peer")
 }
