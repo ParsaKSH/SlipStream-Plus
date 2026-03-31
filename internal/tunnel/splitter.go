@@ -3,12 +3,27 @@ package tunnel
 import (
 	"context"
 	"io"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 )
+
+// ackTimeout is how long to wait for a frame ACK before retrying via another instance.
+const ackTimeout = 3 * time.Second
+
+// maxFrameRetries is the maximum number of retry attempts per frame.
+const maxFrameRetries = 2
+
+// pendingFrame tracks a sent frame awaiting ACK from the CentralServer.
+type pendingFrame struct {
+	frame   *Frame
+	sentAt  time.Time
+	instID  int
+	retries int
+}
 
 // PacketSplitter distributes data from a client connection across multiple
 // instances at the packet/chunk level, and reassembles reverse-direction
@@ -21,6 +36,11 @@ type PacketSplitter struct {
 	incoming  chan *Frame
 
 	txSeq atomic.Uint32
+
+	// ACK tracking: frames awaiting confirmation from CentralServer
+	pendingMu sync.Mutex
+	pending   map[uint32]*pendingFrame // SeqNum → pending
+	stopRetry chan struct{}
 
 	// Weighted round-robin state
 	mu      sync.Mutex
@@ -36,12 +56,17 @@ func NewPacketSplitter(connID uint32, pool *TunnelPool, instances []*engine.Inst
 		instances: instances,
 		chunkSize: chunkSize,
 		incoming:  pool.RegisterConn(connID),
+		pending:   make(map[uint32]*pendingFrame),
+		stopRetry: make(chan struct{}),
 	}
 	ps.recalcWeights()
+	go ps.retryLoop()
 	return ps
 }
 
 func (ps *PacketSplitter) Close() {
+	close(ps.stopRetry)
+
 	fin := &Frame{
 		ConnID: ps.connID,
 		SeqNum: ps.txSeq.Add(1) - 1,
@@ -51,6 +76,63 @@ func (ps *PacketSplitter) Close() {
 		ps.pool.SendFrame(inst.ID(), fin)
 	}
 	ps.pool.UnregisterConn(ps.connID)
+}
+
+// retryLoop periodically checks for unACKed frames and resends them
+// through a different instance.
+func (ps *PacketSplitter) retryLoop() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ps.stopRetry:
+			return
+		case <-ticker.C:
+			ps.retryPending()
+		}
+	}
+}
+
+func (ps *PacketSplitter) retryPending() {
+	now := time.Now()
+
+	ps.pendingMu.Lock()
+	var toRetry []*pendingFrame
+	for seq, pf := range ps.pending {
+		if now.Sub(pf.sentAt) < ackTimeout {
+			continue
+		}
+		if pf.retries >= maxFrameRetries {
+			delete(ps.pending, seq)
+			continue
+		}
+		toRetry = append(toRetry, pf)
+	}
+	ps.pendingMu.Unlock()
+
+	for _, pf := range toRetry {
+		// Pick a different instance than the one that failed
+		inst := ps.pickInstanceExcluding(pf.instID)
+		if inst == nil {
+			inst = ps.pickInstance()
+		}
+		if inst == nil {
+			continue
+		}
+
+		if err := ps.pool.SendFrame(inst.ID(), pf.frame); err != nil {
+			continue
+		}
+
+		ps.pendingMu.Lock()
+		pf.retries++
+		pf.sentAt = now
+		pf.instID = inst.ID()
+		ps.pendingMu.Unlock()
+
+		log.Printf("[splitter] conn=%d: retried seq=%d via instance %d (attempt %d/%d)",
+			ps.connID, pf.frame.SeqNum, inst.ID(), pf.retries, maxFrameRetries)
+	}
 }
 
 func (ps *PacketSplitter) SendSYN(atyp byte, addr []byte, port []byte) error {
@@ -103,12 +185,23 @@ func (ps *PacketSplitter) RelayClientToUpstream(ctx context.Context, client io.R
 			}
 			copy(frame.Payload, buf[:n])
 
+			sentInstID := inst.ID()
 			if sendErr := ps.pool.SendFrame(inst.ID(), frame); sendErr != nil {
 				inst2 := ps.pickInstanceExcluding(inst.ID())
 				if inst2 != nil {
 					ps.pool.SendFrame(inst2.ID(), frame)
+					sentInstID = inst2.ID()
 				}
 			}
+
+			// Track frame for ACK — retryLoop will resend if no ACK arrives
+			ps.pendingMu.Lock()
+			ps.pending[frame.SeqNum] = &pendingFrame{
+				frame:  frame,
+				sentAt: time.Now(),
+				instID: sentInstID,
+			}
+			ps.pendingMu.Unlock()
 		}
 
 		if err != nil {
@@ -173,7 +266,13 @@ func (ps *PacketSplitter) RelayUpstreamToClient(ctx context.Context, client io.W
 				return totalBytes
 			}
 
-			if frame.IsACK() || frame.IsSYN() {
+			if frame.IsACK() {
+				ps.pendingMu.Lock()
+				delete(ps.pending, frame.SeqNum)
+				ps.pendingMu.Unlock()
+				continue
+			}
+			if frame.IsSYN() {
 				continue
 			}
 			if len(frame.Payload) == 0 {
@@ -223,7 +322,29 @@ func (ps *PacketSplitter) recalcWeights() {
 	}
 }
 
+// blockedInstances returns the set of instance IDs that have at least one
+// unACKed frame past ackTimeout. These instances are considered unreliable
+// at this moment and must not receive new packets.
+// Lock order: pendingMu must be acquired BEFORE mu to avoid deadlock.
+func (ps *PacketSplitter) blockedInstances() map[int]bool {
+	now := time.Now()
+	ps.pendingMu.Lock()
+	defer ps.pendingMu.Unlock()
+	var blocked map[int]bool
+	for _, pf := range ps.pending {
+		if now.Sub(pf.sentAt) > ackTimeout {
+			if blocked == nil {
+				blocked = make(map[int]bool)
+			}
+			blocked[pf.instID] = true
+		}
+	}
+	return blocked
+}
+
 func (ps *PacketSplitter) pickInstance() *engine.Instance {
+	blocked := ps.blockedInstances()
+
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
@@ -239,13 +360,20 @@ func (ps *PacketSplitter) pickInstance() *engine.Instance {
 		ps.counter++
 
 		inst := ps.instances[ps.current]
-		if inst.IsHealthy() {
+		if inst.IsHealthy() && !blocked[inst.ID()] {
 			return inst
 		}
 		ps.counter = 0
 		ps.current = (ps.current + 1) % len(ps.instances)
 	}
 
+	// Fallback: any healthy non-blocked instance
+	for _, inst := range ps.instances {
+		if inst.IsHealthy() && !blocked[inst.ID()] {
+			return inst
+		}
+	}
+	// Last resort: any healthy instance even if blocked (avoid total stall)
 	for _, inst := range ps.instances {
 		if inst.IsHealthy() {
 			return inst
@@ -255,6 +383,13 @@ func (ps *PacketSplitter) pickInstance() *engine.Instance {
 }
 
 func (ps *PacketSplitter) pickInstanceExcluding(excludeID int) *engine.Instance {
+	blocked := ps.blockedInstances()
+	for _, inst := range ps.instances {
+		if inst.ID() != excludeID && inst.IsHealthy() && !blocked[inst.ID()] {
+			return inst
+		}
+	}
+	// Fallback: any healthy instance excluding the specified one
 	for _, inst := range ps.instances {
 		if inst.ID() != excludeID && inst.IsHealthy() {
 			return inst

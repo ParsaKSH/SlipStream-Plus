@@ -637,6 +637,14 @@ func (cs *centralServer) handleData(frame *tunnel.Frame, source *sourceConn) {
 	state.lastActive = time.Now()
 	state.reorderer.Insert(frame.SeqNum, frame.Payload)
 
+	// ACK: confirm receipt to the client so it can stop tracking this frame.
+	// Sent async through the delivering source to avoid blocking frame dispatch.
+	go source.WriteFrame(&tunnel.Frame{
+		ConnID: frame.ConnID,
+		SeqNum: frame.SeqNum,
+		Flags:  tunnel.FlagACK,
+	})
+
 	// If upstream not connected yet, data stays in reorderer for later flush
 	writeCh := state.writeCh
 	if writeCh == nil {

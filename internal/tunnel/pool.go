@@ -24,7 +24,7 @@ const staleThreshold = 15 * time.Second
 // ConnsPerInstance is the number of persistent connections to maintain
 // per healthy instance. When one dies, it's replaced on the next refresh.
 // Multiple connections provide redundancy — if one degrades, others serve traffic.
-const ConnsPerInstance = 3
+const ConnsPerInstance = 8
 
 // TunnelConn wraps a persistent TCP connection to a single instance.
 type TunnelConn struct {
