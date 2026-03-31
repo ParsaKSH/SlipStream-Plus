@@ -6,7 +6,8 @@ config.json
 slipstrampluss
 slipstreampluss
 SlipStreamPlus.tar.gz
-centralserver
+centralserver/centralserver
+/centralserver
 central
 slipstreamplusb
 # Rust core binaries (built by CI from source)
@@ -14,3 +15,4 @@ slipstreamorg/slipstream-client-*
 slipstreamorg/slipstream-client.exe
 slipstreamplus-v1.0.4-linux-amd64
 
+slipstreamplusbb
